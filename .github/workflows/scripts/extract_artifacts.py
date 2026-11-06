@@ -8,6 +8,9 @@ import shutil
 
 def is_release_file(filename: str) -> bool:
     """判断是否为发布文件"""
+    # 依赖版本指纹必须随 Release 发布，供与 manager 版本核对
+    if filename == 'BUILD_MANIFEST.txt':
+        return True
     if not filename.startswith('android'):
         return False
     # android...-boot-gz.img, android...-boot-lz4.img, android...-boot.img, android...-AnyKernel3.zip

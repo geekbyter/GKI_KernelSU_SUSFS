@@ -101,13 +101,16 @@ python build.py --list-matrix
 
 ---
 
-## 下载
+## 下载与刷入（重要）
 
-1. **AnyKernel3.zip** - 下载即用！
-   - 使用刷入软件，例如 [HorizonKernelFlasher](https://github.com/libxzr/HorizonKernelFlasher/releases) 进行刷写内核
+1. **推荐：`*-boot-gz.img`**（gzip 压缩内核）
+   - 用 `fastboot flash boot <文件名>` 直接刷入。
+   - **联发科天玑 / android12-5.10 实测：只有 gzip 变体能正常启动**，裸 `boot.img` 与 `boot-lz4.img` 会导致无限重启，请勿刷入。
+2. AnyKernel3.zip - 用 [HorizonKernelFlasher](https://github.com/libxzr/HorizonKernelFlasher/releases) 等工具刷入。
 
-2. **boot.img** - 下载与你内核格式相匹配的（无压缩、gz、lz4）
-   - 使用 [Fastboot](https://magiskcn.com/) 刷入
+刷入前请**备份原厂 boot.img**（`fastboot` 可直接回刷恢复）。本 CI 用自签 `testkey.pem` 给 boot.img 加 AVB footer；若你的设备此前已能刷入本仓库自签的 boot.img 并正常开机，说明校验链已放行，**无需刷 vbmeta**。若刷入后无限重启且已排除压缩格式/ramdisk/KMI 因素，才把 `fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img` 作为排障手段（会削弱 Play 完整性认证，且 MTK 多 vbmeta 槽较敏感，操作前备份原厂 vbmeta.img）。
+
+`BUILD_MANIFEST.txt` 记录了本次内核 / SUSFS / SukiSU_patch / KPM 补丁的真实 commit 与内核 `KSU_VERSION`，**安装 manager 时请核对版本是否同源**。
 
 ---
 
@@ -132,9 +135,11 @@ LZ4K、LZ4HC、deflate、842、lz4k_oplus
 
 ---
 
-## KSU 管理器
+## KSU 管理器（重要）
 
-在编译完成后，会生成最新的管理器 APK。
+**本仓库不构建 manager APK**（README 旧版曾误称「编译完成后会生成最新的管理器 APK」，实际构建链里没有任何 gradle/APK 步骤）。
+
+请自行安装 **与本内核同源（同 commit / 同 KSU_VERSION）的官方 SukiSU-Ultra manager APK**。内核侧 `KERNEL_SU_UAPI_VERSION`、`KSU_VERSION` 数字、manager 包名与签名信任表三者必须一致，否则 manager 会显示「未安装」，或显示已安装但模块 / KPM / App Profile 授权全部不可用。版本指纹见产物里的 `BUILD_MANIFEST.txt`。
 
 ---
 

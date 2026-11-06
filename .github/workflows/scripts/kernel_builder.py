@@ -2,16 +2,69 @@ import os
 import subprocess
 import logging
 import re
+import hashlib
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Callable
 from dataclasses import dataclass, field
 
 from config import (BuildConfig, KSU_REPO_CONFIG, SUSFS_REPO_CONFIG, SUKISU_PATCH_REPO_CONFIG,
                    ANYKERNEL_CONFIG, KERNEL_PATCHES_CONFIG, BBG_CONFIG, TOOLCHAIN_CONFIG,
-                   LEGACY_FIXES, OP8E_PATCH_URL, KPM_PATCH_URL)
+                   LEGACY_FIXES, OP8E_PATCH_URL, KPM_PATCH_URL, KPM_PATCH_SHA256,
+                   KPM_PATCH_UPSTREAM, KSU_MIN_UAPI_VERSION, RECOMMENDED_BOOT_VARIANT,
+                   DISABLED_BOOT_VARIANTS, SUSFS_VERSION_LABEL, KSU_PIN,
+                   SUSFS_PIN, SUKISU_PATCH_PIN)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _read_git_head(repo_dir: Path) -> str:
+    """返回仓库当前 HEAD 的 40 位 SHA（失败返回空串）。"""
+    try:
+        r = subprocess.run("git rev-parse HEAD", shell=True, cwd=str(repo_dir),
+                           capture_output=True, text=True, timeout=30)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _uapi_version(ksu_tree: Path) -> Optional[int]:
+    """读取 KERNEL_SU_UAPI_VERSION，兼容 builtin (DECLARE) / main (static const)。"""
+    pats = [re.compile(r'DECLARE\s*\(\s*__u32\s*,\s*KERNEL_SU_UAPI_VERSION\s*,\s*(\d+)'),
+            re.compile(r'KERNEL_SU_UAPI_VERSION\s*=\s*(\d+)')]
+    for c in [ksu_tree / "kernel/include/uapi/supercall.h", ksu_tree / "uapi/supercall.h"]:
+        try:
+            if c.exists():
+                txt = c.read_text(errors="ignore")
+                for p in pats:
+                    m = p.search(txt)
+                    if m:
+                        return int(m.group(1))
+        except Exception:
+            pass
+    return None
+
+
+def _has_extension_hub(ksu_tree: Path) -> bool:
+    """新版内核必须有 KSU_IOCTL_EXTENSION ('K',300) 扩展 hub。"""
+    for c in [ksu_tree / "kernel/include/uapi/extension.h", ksu_tree / "uapi/extension.h",
+              ksu_tree / "kernel/include/uapi/supercall.h", ksu_tree / "uapi/supercall.h"]:
+        try:
+            if c.exists() and "KSU_IOCTL_EXTENSION" in c.read_text(errors="ignore"):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 @dataclass
@@ -113,6 +166,14 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         self.kernel_patches_dir = self.workspace / "kernel_patches"
         self.toolchain_dir = self.workspace / "toolchain"
         self.mkbootimg_dir = self.workspace / "mkbootimg"
+        self.manifest = {
+            "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "kernel": f"{config.android_version}-{config.kernel_version}.{config.sub_level}-{config.os_patch_level}",
+            "susfs_version_label": SUSFS_VERSION_LABEL,
+            "ksu_pin_requested": KSU_PIN,
+            "susfs_pin_requested": SUSFS_PIN,
+            "sukisu_patch_pin_requested": SUKISU_PATCH_PIN,
+        }
         self._setup_env()
 
     def _setup_env(self):
@@ -143,21 +204,39 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
 
     def clone_repositories(self):
         logger.info("=== 开始克隆仓库 ===")
-        for name, repo_dir, url, branch in [
-            ("SUSFS", self.susfs_dir, SUSFS_REPO_CONFIG['repo_url'], self.config.kernel_branch),
-            ("SukiSU Patch", self.sukisu_patch_dir, SUKISU_PATCH_REPO_CONFIG['repo_url'], None),
-            ("AnyKernel3", self.anykernel_dir, ANYKERNEL_CONFIG['repo_url'], ANYKERNEL_CONFIG['branch']),
-            ("Kernel Patches", self.kernel_patches_dir, KERNEL_PATCHES_CONFIG['repo_url'], None),
+        # pin 为空表示跟随分支 HEAD（不推荐）。默认全部钉到上游已验证互锁的
+        # 一组 commit：susfs v2.3.0 / SukiSU_patch 当前 main。
+        susfs_pin = SUSFS_REPO_CONFIG.get("pin") or ""
+        patch_pin = SUKISU_PATCH_REPO_CONFIG.get("pin") or ""
+
+        for name, repo_dir, url, branch, pin in [
+            ("SUSFS", self.susfs_dir, SUSFS_REPO_CONFIG['repo_url'], self.config.kernel_branch, susfs_pin),
+            ("SukiSU Patch", self.sukisu_patch_dir, SUKISU_PATCH_REPO_CONFIG['repo_url'], None, patch_pin),
+            ("AnyKernel3", self.anykernel_dir, ANYKERNEL_CONFIG['repo_url'], ANYKERNEL_CONFIG['branch'], ""),
+            ("Kernel Patches", self.kernel_patches_dir, KERNEL_PATCHES_CONFIG['repo_url'], None, ""),
         ]:
             if not repo_dir.exists():
                 cmd = f"git clone {url}"
                 if branch:
                     cmd += f" -b {branch}"
                 logger.info(f"克隆 {name}...")
-                self._run_cmd(cmd, check=False)
+                # 关键：clone / pin 失败必须显性报错，不能静默继续（原 check=False）
+                self._run_cmd(cmd, check=True)
             else:
                 logger.info(f"{name} 已存在，跳过")
+            if pin:
+                self._chdir(repo_dir)
+                r = self._run_cmd(f"git checkout --detach {pin}", check=False)
+                if r.returncode != 0:
+                    self._run_cmd(f"git fetch --no-tags origin {pin}", check=True)
+                    self._run_cmd("git checkout --detach FETCH_HEAD", check=True)
+                self._chdir(self.workspace)
         self._apply_susfs_commit()
+        self.manifest["susfs_commit"] = _read_git_head(self.susfs_dir) or "unknown"
+        self.manifest["susfs_branch"] = self.config.kernel_branch
+        self.manifest["sukisu_patch_commit"] = _read_git_head(self.sukisu_patch_dir) or "unknown"
+        logger.info(f"SUSFS HEAD={self.manifest['susfs_commit']}, "
+                    f"SukiSU_patch HEAD={self.manifest['sukisu_patch_commit']}")
         logger.info("=== 仓库克隆完成 ===")
 
     def clone_toolchain(self):
@@ -246,17 +325,138 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 f.write("obj-y += hmbird_patch.o\n")
 
     def add_kernelsu(self):
-        logger.info("=== 添加 KernelSU ===")
+        """检出确定 commit 的 SukiSU-Ultra builtin 内核源码并做协议层硬校验。
+
+        原实现从 main 分支 curl setup.sh 再 `bash -s builtin`，脚本与源码跨
+        分支混用、且 setup.sh 无参时会 checkout 最新 tag 脱离分支；加上
+        check=False，clone/checkout/patch 失败全被吞掉，最后只在 make 阶段
+        报一个无关的顶层错误。这里全部显性化。
+        """
+        logger.info("=== 添加 KernelSU (SukiSU-Ultra builtin, pinned) ===")
         self._chdir(self.work_dir)
-        setup_url = (f"https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/{self.config.kernelsu_commit}/kernel/setup.sh"
-                    if self.config.kernelsu_commit else KSU_REPO_CONFIG["setup_script"])
-        self._run_cmd(f"curl -LSs {setup_url} | bash -s builtin", check=False)
-        if self.config.kernelsu_commit:
-            ksu_dir = self.work_dir / "KernelSU"
-            if ksu_dir.exists():
-                self._chdir(ksu_dir)
-                self._run_cmd(f"git checkout {self.config.kernelsu_commit}", check=False)
-                self._chdir(self.work_dir)
+        ksu_dir = self.work_dir / KSU_REPO_CONFIG["repo_dir"]
+        branch = KSU_REPO_CONFIG["branch"]
+        pin = self.config.kernelsu_commit or KSU_REPO_CONFIG["pin"]
+
+        if not ksu_dir.exists():
+            self._run_cmd(f"git clone --no-checkout {KSU_REPO_CONFIG['repo_url']} "
+                          f"{KSU_REPO_CONFIG['repo_dir']}", check=True)
+        self._chdir(ksu_dir)
+        self._run_cmd(f"git fetch --no-tags origin {branch}", check=True)
+        if pin:
+            r = self._run_cmd(f"git checkout --detach {pin}", check=False)
+            if r.returncode != 0:
+                self._run_cmd(f"git fetch --no-tags origin {pin}", check=True)
+                self._run_cmd("git checkout --detach FETCH_HEAD", check=True)
+        else:
+            self._run_cmd(f"git checkout -B {branch} origin/{branch}", check=True)
+
+        head = _read_git_head(ksu_dir)
+        if not head:
+            raise RuntimeError("无法确定 KernelSU 源码 HEAD，构建中止")
+        logger.info(f"KernelSU HEAD: {head} (branch={branch}, pin={pin or 'HEAD'})")
+
+        # detached HEAD 会让 kernel/Kbuild 的 git 版本启发式失效：
+        # `rev-parse --abbrev-ref HEAD` 返回字面 "HEAD"，merge-base 于是落到
+        # origin/HEAD，KSU_VERSION 随 clone 布局漂移 -> 内核数字版本与
+        # manager/ksud 不一致 -> manager 显示「未安装 / 需更新内核」。
+        # 按 WildKernels root-setup 的做法：unshallow 后显式算 base commit，
+        # 把确定值追加进 Kbuild（只覆盖含该启发式的文件）。
+        self._pin_ksu_version(ksu_dir, head, branch)
+
+        uapi = _uapi_version(ksu_dir)
+        ext = _has_extension_hub(ksu_dir)
+        logger.info(f"KSU UAPI={uapi}, extension_hub={ext}")
+        if uapi is None:
+            raise RuntimeError("读不到 KERNEL_SU_UAPI_VERSION：内核源码布局可能已变化")
+        if uapi < KSU_MIN_UAPI_VERSION or not ext:
+            raise RuntimeError(
+                f"内核过旧或不兼容 (UAPI={uapi}, extension_hub={ext})："
+                f"需要 UAPI>={KSU_MIN_UAPI_VERSION} 且含 KSU_IOCTL_EXTENSION，"
+                f"否则新版 manager 会显示「未安装」且模块/KPM/授权全废。pin={pin}")
+
+        self.manifest.update({
+            "ksu_commit": head, "ksu_branch": branch, "ksu_pin": pin or "HEAD",
+            "ksu_uapi_version": uapi, "ksu_extension_hub": ext,
+        })
+
+        self._chdir(self.work_dir)
+        setup_sh = ksu_dir / KSU_REPO_CONFIG["setup_script_rel"]
+        if not setup_sh.exists():
+            raise RuntimeError(f"缺少 {setup_sh}：无法集成内核源码")
+        # 绝不执行 setup.sh：builtin 版内部会 `git checkout main` + `git pull`
+        # + `git checkout 最新 tag`，把上面刚 pin 好的源码覆盖掉；--cleanup
+        # 还会直接 `rm -rf KernelSU/`。这里只复用它的三个集成动作（软链、
+        # Makefile、Kconfig），由 _setup_kernelsu_symlink 完成。
+        self._setup_kernelsu_symlink(ksu_dir)
+
+    def _pin_ksu_version(self, ksu_dir: Path, head: str, branch: str):
+        """保证内核的 KSU_VERSION 与官方 manager/ksud 同源，不擅自改公式。
+
+        关键事实（实测 git 历史）：
+          - builtin:kernel/Makefile 写死 REPO_BRANCH := main，
+            KSU_VERSION = 40000 + count(main) - 2815；
+          - main:kernel/Kbuild 与 userspace/ksud/build.rs 用完全相同的
+            40000 - 2815 + rev-list --count HEAD(main)。
+        三者同源，官方值当前是 41151 (main 3966 commits)。
+
+        因此**绝不能**用 builtin 自身或 merge-base(builtin, main) 的提交数
+        去 override：那会算出 41865 / 41010，反而把正确的 41151 改坏，
+        正是 manager「显示未安装」的成因之一。
+
+        唯一要防的是：detached + shallow clone 下本地 `main` ref 不存在，
+        且 GITHUB_COMMITS (GitHub API 限流) 为空时，Makefile 会掉到兜底
+        值 13000。做法是 unshallow 并显式 fetch main，让 `rev-list --count
+        main` 可用；公式本身保持内核原样。
+        """
+        shallow = ksu_dir / ".git" / "shallow"
+        if shallow.exists():
+            self._run_cmd("git fetch --unshallow --tags origin", check=False)
+        if shallow.exists():
+            logger.warning("仓库仍是 shallow clone，KSU_VERSION 可能不准确")
+        # 显式把 main 取成本地可数 ref，供 kernel/Makefile 的
+        # `rev-list --count main` 使用（与官方 manager 同源）。
+        self._run_cmd("git fetch --no-tags origin main:refs/remotes/origin/main", check=False)
+        self._run_cmd("git fetch --no-tags origin main:refs/heads/main", check=False)
+        r = self._run_cmd("git rev-list --count refs/remotes/origin/main",
+                          check=False, capture_output=True)
+        count = int((r.stdout or "0").strip() or 0) if r.returncode == 0 else 0
+        version = 40000 + count - 2815
+        self.manifest.update(ksu_version_expected=version,
+                             ksu_version_main_commit_count=count,
+                             ksu_version_formula="40000 + count(main) - 2815 (unchanged)")
+        if count:
+            logger.info(f"内核 KSU_VERSION 预期={version} (40000 + {count} - 2815, main)")
+        else:
+            logger.warning("无法数 main 提交数；若 GitHub API 也限流，KSU_VERSION 可能掉到 13000，"
+                           "manager 会报版本不匹配 —— 请检查 BUILD_MANIFEST.txt")
+
+    def _setup_kernelsu_symlink(self, ksu_dir: Path):
+        """等价于 setup.sh 的集成动作，但不做 clone/pull/checkout。"""
+        common = self.work_dir / "common"
+        driver_dir = common / "drivers" if (common / "drivers").is_dir() else self.work_dir / "drivers"
+        if not driver_dir.is_dir():
+            raise RuntimeError(f"找不到 drivers/ 目录: {driver_dir}")
+        link = driver_dir / "kernelsu"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        rel = os.path.relpath(ksu_dir / "kernel", driver_dir)
+        link.symlink_to(rel)
+        mk = driver_dir / "Makefile"
+        content = mk.read_text(errors="ignore")
+        if "kernelsu" not in content:
+            with open(mk, "a") as f:
+                f.write("\nobj-$(CONFIG_KSU) += kernelsu/\n")
+        kc = driver_dir / "Kconfig"
+        content = kc.read_text(errors="ignore")
+        if 'source "drivers/kernelsu/Kconfig"' not in content:
+            lines = content.split("\n")
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i].strip() == "endmenu":
+                    lines.insert(i, 'source "drivers/kernelsu/Kconfig"')
+                    break
+            kc.write_text("\n".join(lines))
+        logger.info(f"已软链 drivers/kernelsu -> {rel}")
 
     def add_bbg(self):
         if not self.config.use_bbg:
@@ -298,7 +498,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             patch_file = common_dir / self.config.get_susfs_patch_filename()
             if patch_file.exists():
                 self._chdir(common_dir)
-                self._run_cmd(f"patch -p1 --fuzz=3 < {patch_file}", check=False)
+                self._run_cmd(f"patch -p1 --fuzz=3 < {patch_file}", check=True)  # SUSFS 补丁冲突必须显性失败
                 self._chdir(self.work_dir)
 
     def apply_sukisu_patches(self):
@@ -306,7 +506,9 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         self._chdir(self.work_dir / "common")
         hooks_patch = self.sukisu_patch_dir / "69_hide_stuff.patch"
         if hooks_patch.exists():
-            self._run_cmd(f"cp {hooks_patch} . && patch -p1 -F 3 < 69_hide_stuff.patch", check=False)
+            # 69_hide_stuff.patch 是 2024-12 的老补丁，与 susfs v2.3.0 的
+            # task_mmu.c 改动可能冲突。冲突时中止，不再静默产出半修补的内核。
+            self._run_cmd(f"cp {hooks_patch} . && patch -p1 -F 3 < 69_hide_stuff.patch", check=True)
 
     def apply_zram_patches(self):
         if not self.config.use_zram:
@@ -627,22 +829,48 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             return False
 
     def patch_kpm_image(self):
-        if not self.config.use_kpm or self.config.kernel_version == "6.6":
+        """给 kernel Image 注入 KernelPatch (kpimg)。CONFIG_KPM=y 只是桥接层，
+        运行时还需要 Image 被打过补丁，否则 kpm version 返回 -EOPNOTSUPP。"""
+        if not self.config.use_kpm:
+            self.manifest.update(kpm_patched=False, kpm_skip_reason="use_kpm=false")
             return
+        if self.config.kernel_version == "6.6":
+            self.manifest.update(kpm_patched=False,
+                                 kpm_skip_reason="6.6 KPM patch skipped (known stability issues)")
+            logger.warning("=== 跳过 KPM 补丁 (6.6 已知稳定性问题) ===")
+            return
+
         logger.info("=== 修补 Image 文件 (KPM) ===")
         self._chdir(self.work_dir)
-
         if self.config.android_version in ["android12", "android13"]:
             image_dir = self.work_dir / f"out/{self.config.android_version}-{self.config.kernel_version}/dist"
         else:
             image_dir = self.work_dir / "bazel-bin/common/kernel_aarch64"
-
         if not image_dir.exists():
-            return
+            raise RuntimeError(f"KPM: 找不到内核产物目录 {image_dir}")
+
         self._chdir(image_dir)
-        self._run_cmd(f"curl -LSs {KPM_PATCH_URL} -o patch && chmod 777 patch && ./patch", check=False)
-        if (image_dir / "oImage").exists():
-            self._run_cmd("mv oImage Image", check=False)
+        patch_path = image_dir / "patch"
+        self._run_cmd(f"curl -fL --retry 3 -Ss {KPM_PATCH_URL} -o patch", check=True)
+        if not patch_path.exists() or patch_path.stat().st_size < 1024:
+            raise RuntimeError("KPM: 补丁下载失败或文件异常小")
+        digest = _sha256_file(patch_path)
+        logger.info(f"KPM patch sha256: {digest}")
+        self.manifest.update(kpm_patch_url=KPM_PATCH_URL, kpm_patch_sha256=digest,
+                             kpm_patch_upstream=KPM_PATCH_UPSTREAM)
+        if KPM_PATCH_SHA256:
+            if digest.lower() != KPM_PATCH_SHA256.lower():
+                raise RuntimeError(f"KPM 补丁 sha256 不匹配: 期望 {KPM_PATCH_SHA256} 实际 {digest}")
+            self.manifest["kpm_patch_sha256_verified"] = True
+        else:
+            self.manifest["kpm_patch_sha256_verified"] = False
+        self._run_cmd("chmod 755 patch && ./patch", check=True)
+        oimage = image_dir / "oImage"
+        if not oimage.exists() or oimage.stat().st_size < 1024 * 1024:
+            raise RuntimeError("KPM: patch 未生成有效 oImage，中止（避免产出未打补丁的内核）")
+        self._run_cmd("rm -f patch && mv oImage Image", check=True)
+        self.manifest["kpm_patched"] = True
+        logger.info("=== KPM 补丁已应用 ===")
 
     def prepare_boot_images(self) -> list:
         logger.info("=== 准备启动镜像 ===")
@@ -710,8 +938,9 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         artifacts = []
         ak3_dir = self.anykernel_dir
 
-        for suffix in ["", "-lz4", "-gz"]:
-            image_file = f"Image{suffix}"
+        # 实际文件是 Image.lz4 / Image.gz（点号）；原连字符写法让 lz4/gz 包成死分支
+        for suffix, file_suffix in [("", ""), ("-lz4", ".lz4"), ("-gz", ".gz")]:
+            image_file = f"Image{file_suffix}"
             image_path = self.work_dir / image_file
             if not image_path.exists():
                 continue
@@ -755,9 +984,50 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             artifacts.extend(self.prepare_boot_images())
             artifacts.extend(self.create_anykernel_zips())
 
+            self._write_manifest(artifacts)
+            self._verify_artifacts(artifacts)
+
             build_time = time.time() - start_time
             logger.info(f"构建成功! 耗时: {build_time:.2f} 秒, 生成 {len(artifacts)} 个产物")
             return BuildResult(success=True, config=self.config, message="构建成功", artifacts=artifacts, build_time=build_time)
         except Exception as e:
             logger.error(f"构建过程出错: {e}")
             return BuildResult(success=False, config=self.config, message=str(e), build_time=time.time() - start_time)
+
+
+    def _write_manifest(self, artifacts: list):
+        """BUILD_MANIFEST.txt：内核/manager/SUSFS/KPM 各依赖的真实 commit。"""
+        self.manifest["recommended_variant"] = RECOMMENDED_BOOT_VARIANT
+        self.manifest["disabled_variants"] = list(DISABLED_BOOT_VARIANTS)
+        self.manifest["artifacts"] = [Path(a).name for a in artifacts]
+        out = self.work_dir / "BUILD_MANIFEST.txt"
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("# GKI 构建依赖版本指纹\n")
+            f.write("# 安装 manager 时请使用与本内核同源 (同 commit) 的官方 APK\n\n")
+            f.write(json.dumps(self.manifest, indent=2, ensure_ascii=False, sort_keys=True))
+            f.write("\n")
+        logger.info(f"已写出 {out}")
+        artifacts.append(str(out))
+
+    def _verify_artifacts(self, artifacts: list):
+        """宁可构建失败，也不产出「看起来成功」的残缺镜像。"""
+        boots = [Path(a) for a in artifacts if a.endswith(".img") and "boot" in Path(a).name]
+        if not boots:
+            raise RuntimeError("自检失败：没有产出任何 boot*.img")
+        for img in boots:
+            if not img.exists() or img.stat().st_size < 1024 * 1024:
+                raise RuntimeError(f"自检失败：{img.name} 缺失或异常小")
+        if not [i for i in boots if i.name.endswith("-boot-gz.img")]:
+            raise RuntimeError("自检失败：缺少 boot-gz.img（本机唯一可启动压缩格式）")
+        image_gz = self.work_dir / "Image.gz"
+        if image_gz.exists() and self._run_cmd(f"gzip -t {image_gz}", check=False).returncode != 0:
+            raise RuntimeError("自检失败：Image.gz 不是有效 gzip 文件")
+        avbtool = self.env.get("AVBTOOL", "")
+        if avbtool and Path(avbtool).exists() and self.env.get("BOOT_SIGN_KEY_PATH"):
+            for img in boots:
+                if self._run_cmd(f"{avbtool} info_image --image {img}", check=False).returncode != 0:
+                    logger.warning(f"AVB footer 校验未通过: {img.name}（设备已禁用校验时可忽略）")
+        if self.config.use_kpm and self.config.kernel_version != "6.6" and not self.manifest.get("kpm_patched"):
+            raise RuntimeError("自检失败：启用 KPM 但补丁未标记成功")
+        logger.info(f"=== 产物自检通过：{len(boots)} 个 boot 镜像 ===")
+

@@ -150,6 +150,24 @@ jobs:
           restore-keys: |
             ${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}-${{ github.event.inputs.sub_level }}-ccache-
 
+      # AVB 自签 key 是可选的：设备若已能刷入本仓库自签的 boot.img 并正常
+      # 开机（例如已解锁且校验链放行），不配置也能用，avbtool 失败会被
+      # check=False 吞掉，只是产物没有 AVB footer。
+      # 配置时把 PEM 私钥全文粘进 Secret BOOT_SIGN_KEY 即可；不配置则
+      # 不设置 BOOT_SIGN_KEY_PATH，构建脚本会跳过 AVB 自检，日志更干净。
+      - name: Setup AVB signing key (optional)
+        env:
+          BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
+        run: |
+          if [ -n "$BOOT_SIGN_KEY" ]; then
+            mkdir -p toolchain/linux-x86/bin
+            printf '%s\n' "$BOOT_SIGN_KEY" > toolchain/linux-x86/bin/testkey.pem
+            echo "BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/toolchain/linux-x86/bin/testkey.pem" >> $GITHUB_ENV
+            echo "AVB signing key configured"
+          else
+            echo "BOOT_SIGN_KEY not set; boot.img will be produced without an AVB footer"
+          fi
+
       - name: Build kernel
         run: |
           cd ./.github/workflows/scripts
@@ -178,6 +196,12 @@ jobs:
           mkdir -p artifacts
           find /tmp/gki-build -name "*.zip" -type f -exec cp {} artifacts/ \;
           find /tmp/gki-build -name "*.img" -type f -exec cp {} artifacts/ \;
+          find /tmp/gki-build -name "BUILD_MANIFEST.txt" -type f -exec cp {} artifacts/ \;
+          if [ -z "$(ls -A artifacts/)" ]; then
+            echo "没有找到构建产物，构建失败" >&2
+            exit 1
+          fi
+          ls -la artifacts/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

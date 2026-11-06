@@ -118,13 +118,19 @@ jobs:
           sudo apt install -y ccache python3 git curl wget zip unzip xz-utils openssl pixz
           pip install PyYAML
 
-      - name: Setup AVB signing key
+      # 可选：BOOT_SIGN_KEY 未配置时不设 BOOT_SIGN_KEY_PATH，产物无 AVB footer。
+      - name: Setup AVB signing key (optional)
         env:
           BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
         run: |
-          mkdir -p toolchain/linux-x86/bin
-          echo "$BOOT_SIGN_KEY" > toolchain/linux-x86/bin/testkey.pem
-          echo "BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/toolchain/linux-x86/bin/testkey.pem" >> $GITHUB_ENV
+          if [ -n "$BOOT_SIGN_KEY" ]; then
+            mkdir -p toolchain/linux-x86/bin
+            printf '%s\n' "$BOOT_SIGN_KEY" > toolchain/linux-x86/bin/testkey.pem
+            echo "BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/toolchain/linux-x86/bin/testkey.pem" >> $GITHUB_ENV
+            echo "AVB signing key configured"
+          else
+            echo "BOOT_SIGN_KEY not set; boot.img will be produced without an AVB footer"
+          fi
 
       - name: Configure ccache
         run: |
@@ -178,6 +184,7 @@ jobs:
           mkdir -p artifacts
           find /tmp/gki-build -name "*.zip" -type f -exec cp {} artifacts/ \;
           find /tmp/gki-build -name "*.img" -type f -exec cp {} artifacts/ \;
+          find /tmp/gki-build -name "BUILD_MANIFEST.txt" -type f -exec cp {} artifacts/ \;
           if [ -z "$(ls -A artifacts/)" ]; then
             echo "没有找到构建产物"
             echo "artifacts_exist=false" >> $GITHUB_OUTPUT
@@ -284,8 +291,10 @@ jobs:
         uses: softprops/action-gh-release@v3
         id: create_release
         with:
-          tag_name: ${{ needs.prepare.outputs.kernel_version }}
-          name: GKI Kernel ${{ needs.prepare.outputs.kernel_version }}
+          # kernel_version 现在是静态的 SUSFS 版本标签 (v2.3.0)，若直接当
+          # tag 会导致每次构建互相覆盖同一个 Release。加 run_id 保证唯一。
+          tag_name: ${{ needs.prepare.outputs.kernel_version }}-${{ github.run_id }}
+          name: GKI Kernel ${{ needs.prepare.outputs.kernel_version }} (run ${{ github.run_id }})
           draft: false
           generate_release_notes: false
           files: |
