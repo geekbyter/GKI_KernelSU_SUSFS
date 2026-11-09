@@ -616,6 +616,64 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 with open(task_mmu, "w") as f:
                     f.write(content)
 
+    def _fix_assoc_array_header(self):
+        """让 struct assoc_array 无条件完整，根治 asm-offsets 的 incomplete type。
+
+        现象（android12-5.10 / prepare0 阶段）：
+          include/linux/key.h:259: error: field has incomplete type 'struct assoc_array'
+          arch/arm64/kernel/asm-offsets.c 经 <linux/sched.h> -> <linux/cred.h>
+          -> <linux/key.h> 引入该头文件。
+
+        根因：include/linux/assoc_array.h 把 struct assoc_array 的定义包在
+        #ifdef CONFIG_ASSOCIATIVE_ARRAY 里；而本构建链生成的 .config 里
+        CONFIG_KEYS 生效（struct key 被展开）但 CONFIG_ASSOCIATIVE_ARRAY
+        没被 select（或 append 到 gki_defconfig 的配置没进最终 .config）。
+
+        上一轮试过在 gki_defconfig 追加 CONFIG_KEYS=y / CONFIG_ASSOCIATIVE_ARRAY=y，
+        报错一字不变 -> 说明 defconfig 文本追加对 GKI 的 fragment 拼装无效。
+        因此改为直接改头文件：去掉这一对 #ifdef / #endif，让整个头文件
+        无条件生效。
+
+        安全性：该头文件只有类型定义、extern 函数声明和一个 static inline，
+        没有变量定义；lib/assoc_array.c 是否编译由 Makefile 的
+        obj-$(CONFIG_ASSOCIATIVE_ARRAY) 控制，头文件展开不会多出实现。
+        key.h 因此永远能拿到完整类型，且不影响任何功能。
+        """
+        header = self.work_dir / "common" / "include" / "linux" / "assoc_array.h"
+        if not header.exists():
+            logger.warning(f"未找到 {header}，跳过 assoc_array 修复")
+            return
+        content = header.read_text(errors="ignore")
+        if "CONFIG_ASSOCIATIVE_ARRAY" not in content:
+            logger.info("assoc_array.h 已无条件，无需修复")
+            return
+        lines = content.split("\n")
+        out = []
+        removed = 0
+        for line in lines:
+            s = line.strip()
+            # 只去掉最外层的条件编译对，保留 include guard 的 #endif
+            if s == "#ifdef CONFIG_ASSOCIATIVE_ARRAY":
+                out.append("/* GKI_KernelSU_SUSFS: struct assoc_array 定义改为无条件，"
+                           "避免 key.h 的 incomplete type（见 _fix_assoc_array_header） */")
+                removed += 1
+                continue
+            if s == "#endif /* CONFIG_ASSOCIATIVE_ARRAY */" or s == "#endif // CONFIG_ASSOCIATIVE_ARRAY":
+                removed += 1
+                continue
+            out.append(line)
+        # 必须成对移除：只删到一个会留下孤立的 #ifdef/#endif，反而制造新错误。
+        if removed != 2:
+            raise RuntimeError(
+                f"assoc_array.h 条件编译对不完整（预期移除 2 行，实际 {removed}），"
+                "上游头文件格式可能已变化，构建中止以免产出更坏的内核")
+        new_content = "\n".join(out)
+        if "struct assoc_array" not in new_content or "CONFIG_ASSOCIATIVE_ARRAY" in new_content:
+            raise RuntimeError("assoc_array.h 修复后结构异常，构建中止")
+        header.write_text(new_content)
+        self.manifest["assoc_array_header_unconditional"] = True
+        logger.info("已让 assoc_array.h 无条件生效（struct assoc_array 完整可见）")
+
     def _fix_base_c_header(self):
         base_c = self.work_dir / "common/fs/proc/base.c"
         if not base_c.exists():
@@ -1023,6 +1081,9 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             self.configure_kernel()
             self.configure_kernel_name()
             self.show_kernel_config()
+            # 配置层追加对该 GKI fragment 拼装无效，直接在头文件层根治
+            # asm-offsets 的 `struct assoc_array` incomplete type（仅 5.10 需要）
+            self._fix_assoc_array_header()
 
             if not self.build_kernel():
                 return BuildResult(success=False, config=self.config, message="内核编译失败", build_time=time.time() - start_time)
