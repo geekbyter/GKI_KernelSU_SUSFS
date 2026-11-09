@@ -674,6 +674,71 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         self.manifest["assoc_array_header_unconditional"] = True
         logger.info("已让 assoc_array.h 无条件生效（struct assoc_array 完整可见）")
 
+    def _fix_vdso_gettimeofday_include(self):
+        """补齐 VDSO 的 -include，让 clockid_t / __cvdso_* 可见。
+
+        现象（vdso_prepare 阶段）：
+          arch/arm64/kernel/vdso/vgettimeofday.c: unknown type name 'clockid_t'
+          declaration of 'struct __kernel_timespec' will not be visible ...
+          implicit declaration of '__cvdso_clock_gettime' ...
+
+        根因：vgettimeofday.c 自身没有任何 #include，全部类型/函数靠
+        arch/arm64/kernel/vdso/Makefile 的
+            CFLAGS_vgettimeofday.o += -include $(c-gettimeofday-y)
+        注入；而 lib/vdso/Makefile 里
+            c-gettimeofday-$(CONFIG_GENERIC_GETTIMEOFDAY) := .../gettimeofday.c
+        本构建链最终 .config 里 CONFIG_GENERIC_GETTIMEOFDAY 未生效，
+        $(c-gettimeofday-y) 为空，-include 没加上。
+
+        与 _fix_assoc_array_header 同属「配置层不可靠，直接在源码层补齐」的
+        确定性修复：无条件给该目标追加 -include lib/vdso/gettimeofday.c。
+        使用 `?=` 风格的追加（CFLAGS_vgettimeofday.o += ...），不覆盖已有的
+        同名定义，且 lib/vdso/gettimeofday.c 在 GKI 源码里确实存在。
+        """
+        vdso_mk = self.work_dir / "common" / "arch" / "arm64" / "kernel" / "vdso" / "Makefile"
+        generic = self.work_dir / "common" / "lib" / "vdso" / "gettimeofday.c"
+        if not vdso_mk.exists():
+            logger.warning(f"未找到 {vdso_mk}，跳过 VDSO 修复")
+            return
+        if not generic.exists():
+            raise RuntimeError(f"缺少 {generic}，无法补齐 VDSO -include")
+        content = vdso_mk.read_text(errors="ignore")
+        if "GKI_KernelSU_SUSFS: vdso -include fix" in content:
+            logger.info("VDSO -include 已补过，跳过")
+            return
+        with open(vdso_mk, "a") as f:
+            f.write("\n# GKI_KernelSU_SUSFS: vdso -include fix\n")
+            f.write("# CONFIG_GENERIC_GETTIMEOFDAY 未进最终 .config 时，\n")
+            f.write("# $(c-gettimeofday-y) 为空，vgettimeofday.c 拿不到类型/函数声明。\n")
+            f.write("# 用 $(srctree) 绝对路径无条件注入，避免依赖配置。\n")
+            f.write("CFLAGS_vgettimeofday.o += -include $(srctree)/lib/vdso/gettimeofday.c\n")
+        self.manifest["vdso_include_added"] = True
+        logger.info("已为 vgettimeofday.o 补齐 -include $(srctree)/lib/vdso/gettimeofday.c")
+
+    def _dump_final_config(self):
+        """编译前打印 .config 里关键 CONFIG 的真实值，便于定位配置层问题。
+
+        连续多轮报错都源于「append 到 gki_defconfig 的配置没进最终 .config」，
+        有了这段输出，下一轮可以直接看真实值，不必再逐个猜。
+        """
+        cfg = self.work_dir / "common" / ".config"
+        if not cfg.exists():
+            # 部分构建方式把 .config 放在 out/ 下
+            candidates = list(self.work_dir.glob("**/.config"))
+            cfg = candidates[0] if candidates else None
+        if not cfg:
+            logger.info("（编译前尚未生成 .config，跳过关键项打印）")
+            return
+        keys = ("CONFIG_KEYS", "CONFIG_ASSOCIATIVE_ARRAY",
+                "CONFIG_GENERIC_GETTIMEOFDAY", "CONFIG_KSU", "CONFIG_KPM",
+                "CONFIG_KSU_SUSFS", "CONFIG_HEADERS_INSTALL")
+        lines = cfg.read_text(errors="ignore").split("\n")
+        logger.info(f"=== 最终 .config 关键项（{cfg}） ===")
+        for k in keys:
+            hit = next((l.strip() for l in lines if l.strip().startswith(k + "=")), None)
+            logger.info(f"  {k} = {hit if hit else '(# not set / 缺失)'}")
+        self.manifest["config_dump_path"] = str(cfg)
+
     def _fix_base_c_header(self):
         base_c = self.work_dir / "common/fs/proc/base.c"
         if not base_c.exists():
@@ -709,13 +774,34 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             with open(config_file, "a") as f:
                 f.write("CONFIG_DEFAULT_BBR=y\n")
 
+        # ------------------------------------------------------------------
+        # 绝对不要删除 build.config.gki 里的 `POST_DEFCONFIG_CMDS="check_defconfig"`。
+        #
+        # 原实现 `content.replace("check_defconfig", "")` 是为了绕过「往
+        # gki_defconfig 追加自定义 CONFIG 后 defconfig 校验报错」，但它带来
+        # 灾难性副作用：check_defconfig 是 GKI 官方流程里 make defconfig
+        # 之后负责把 Kconfig 的 select/default 结果固化进 .config 的关键步骤。
+        # 删掉它之后，最终 .config 里所有「被 select 但没在 gki_defconfig
+        # 显式写出」的基础配置全部丢失，例如：
+        #   CONFIG_ASSOCIATIVE_ARRAY   -> key.h 的 struct assoc_array 不完整
+        #   CONFIG_GENERIC_GETTIMEOFDAY-> vdso/vgettimeofday.c 缺 -include
+        # 表现为编译最早期（asm-offsets / vdso_prepare）连续报错，补一个
+        # 冒出下一个。逐条打头文件补丁是治标，这里才是根因。
+        #
+        # 自定义 CONFIG 通过 KSU/SUSFS 自带的 Kconfig 定义（CONFIG_KSU、
+        # CONFIG_KSU_SUSFS_* 等），make defconfig 会正常识别；把它们追加到
+        # gki_defconfig 只是显式固化，check_defconfig 不会因此报错。
+        # 若个别版本校验仍失败，正确做法是看 check_defconfig 的输出调整
+        # 具体 CONFIG，而不是把整个校验删掉。
+        # ------------------------------------------------------------------
         build_config = self.work_dir / "common/build.config.gki"
         if build_config.exists():
-            with open(build_config, "r") as f:
-                content = f.read()
-            content = content.replace("check_defconfig", "")
-            with open(build_config, "w") as f:
-                f.write(content)
+            content = build_config.read_text(errors="ignore")
+            if "check_defconfig" not in content:
+                logger.warning("build.config.gki 缺少 check_defconfig（上游可能已变更），"
+                               "基础配置可能丢失，请检查最终 .config")
+            else:
+                logger.info("保留 POST_DEFCONFIG_CMDS=check_defconfig（GKI 依赖它固化 select 配置）")
 
     def _configure_zram(self):
         config_file = self.work_dir / "common/arch/arm64/configs/gki_defconfig"
@@ -927,6 +1013,11 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                     logger.error(line)
                 if not errors:
                     logger.error("未捕获到显式 error 行，请查看上方完整构建日志")
+                # 编译跑过 make defconfig，此刻 .config 已生成；把关键项
+                # 打出来，直接判断 append 到 gki_defconfig 的配置是否生效，
+                # 避免下一轮再靠猜。
+                logger.error("=== 最终 .config 关键项（诊断） ===")
+                self._dump_final_config()
                 return False
             logger.info("=== 内核编译成功 ===")
             return True
@@ -1081,9 +1172,11 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             self.configure_kernel()
             self.configure_kernel_name()
             self.show_kernel_config()
-            # 配置层追加对该 GKI fragment 拼装无效，直接在头文件层根治
-            # asm-offsets 的 `struct assoc_array` incomplete type（仅 5.10 需要）
+            # 配置层追加对该 GKI fragment 拼装无效，直接在源码层补齐：
+            #   assoc_array.h -> struct assoc_array 无条件完整（asm-offsets）
+            #   vdso/Makefile -> 无条件 -include（vdso_prepare）
             self._fix_assoc_array_header()
+            self._fix_vdso_gettimeofday_include()
 
             if not self.build_kernel():
                 return BuildResult(success=False, config=self.config, message="内核编译失败", build_time=time.time() - start_time)
