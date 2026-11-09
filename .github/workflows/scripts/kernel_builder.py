@@ -675,47 +675,55 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         logger.info("已让 assoc_array.h 无条件生效（struct assoc_array 完整可见）")
 
     def _fix_vdso_gettimeofday_include(self):
-        """补齐 VDSO 的 -include，让 clockid_t / __cvdso_* 可见。
+        """从源头补齐 c-gettimeofday-y，一次覆盖 vdso 与 vdso32。
 
-        现象（vdso_prepare 阶段）：
-          arch/arm64/kernel/vdso/vgettimeofday.c: unknown type name 'clockid_t'
-          declaration of 'struct __kernel_timespec' will not be visible ...
-          implicit declaration of '__cvdso_clock_gettime' ...
+        现象（连续两轮）：
+          第 5 轮  arch/arm64/kernel/vdso/vgettimeofday.c  报 clockid_t 等不可见
+          第 7 轮  arch/arm64/kernel/vdso32/vgettimeofday.c 报同样错误
+        两者都是 vgettimeofday.c 自身无 #include，靠各自 Makefile 的
+            ifneq ($(c-gettimeofday-y),)
+              CFLAGS_vgettimeofday.o += -include $(c-gettimeofday-y)   # vdso
+              VDSO_CFLAGS_gettimeofday_o += -include $(c-gettimeofday-y) # vdso32
+            endif
+        注入类型/函数。而两个 Makefile 都 include 了 lib/vdso/Makefile，其中
+            c-gettimeofday-$(CONFIG_GENERIC_GETTIMEOFDAY) := $(GENERIC_VDSO_DIR)gettimeofday.c
+        本构建链最终 .config 里 CONFIG_GENERIC_GETTIMEOFDAY 缺失 -> 变量为空
+        -> 两个 arch 都缺 -include。
 
-        根因：vgettimeofday.c 自身没有任何 #include，全部类型/函数靠
-        arch/arm64/kernel/vdso/Makefile 的
-            CFLAGS_vgettimeofday.o += -include $(c-gettimeofday-y)
-        注入；而 lib/vdso/Makefile 里
-            c-gettimeofday-$(CONFIG_GENERIC_GETTIMEOFDAY) := .../gettimeofday.c
-        本构建链最终 .config 里 CONFIG_GENERIC_GETTIMEOFDAY 未生效，
-        $(c-gettimeofday-y) 为空，-include 没加上。
+        所以逐个给 vdso/vdso32 打补丁是打地鼠，正解是在**共同源头**
+        lib/vdso/Makefile 里让变量在 CONFIG 未生效时回落到同一文件：
+            ifeq ($(c-gettimeofday-y),)
+            c-gettimeofday-y := $(GENERIC_VDSO_DIR)gettimeofday.c
+            endif
+        这样 vdso 和 vdso32 的 ifneq 都会自动成立，走 GKI 官方原本的
+        -include 路径，与 CONFIG_GENERIC_GETTIMEOFDAY=y 时完全等价。
 
-        与 _fix_assoc_array_header 同属「配置层不可靠，直接在源码层补齐」的
-        确定性修复：无条件给该目标追加 -include lib/vdso/gettimeofday.c。
-        使用 `?=` 风格的追加（CFLAGS_vgettimeofday.o += ...），不覆盖已有的
-        同名定义，且 lib/vdso/gettimeofday.c 在 GKI 源码里确实存在。
+        幂等：用标记注释防重复追加。
         """
-        vdso_mk = self.work_dir / "common" / "arch" / "arm64" / "kernel" / "vdso" / "Makefile"
+        lib_mk = self.work_dir / "common" / "lib" / "vdso" / "Makefile"
         generic = self.work_dir / "common" / "lib" / "vdso" / "gettimeofday.c"
-        if not vdso_mk.exists():
-            logger.warning(f"未找到 {vdso_mk}，跳过 VDSO 修复")
-            return
+        if not lib_mk.exists():
+            raise RuntimeError(f"缺少 {lib_mk}，无法修复 VDSO")
         if not generic.exists():
-            raise RuntimeError(f"缺少 {generic}，无法补齐 VDSO -include")
-        content = vdso_mk.read_text(errors="ignore")
-        if "GKI_KernelSU_SUSFS: vdso -include fix" in content:
-            logger.info("VDSO -include 已补过，跳过")
+            raise RuntimeError(f"缺少 {generic}，无法修复 VDSO")
+        content = lib_mk.read_text(errors="ignore")
+        if "GKI_KernelSU_SUSFS: c-gettimeofday fallback" in content:
+            logger.info("c-gettimeofday-y 回落已补过，跳过")
             return
-        with open(vdso_mk, "a") as f:
-            f.write("\n# GKI_KernelSU_SUSFS: vdso -include fix\n")
-            f.write("# CONFIG_GENERIC_GETTIMEOFDAY 未进最终 .config 时，\n")
-            f.write("# $(c-gettimeofday-y) 为空，vgettimeofday.c 拿不到类型/函数声明。\n")
-            f.write("# 仅在该变量为空时补齐，避免与原有 -include 重复包含同一文件。\n")
+        # 必须存在官方那行定义，避免上游改名后盲目追加
+        if "c-gettimeofday-$(CONFIG_GENERIC_GETTIMEOFDAY)" not in content:
+            raise RuntimeError("lib/vdso/Makefile 缺少 c-gettimeofday-$(...) 定义，"
+                               "上游可能已变更，中止以免产出更坏的内核")
+        with open(lib_mk, "a") as f:
+            f.write("\n# GKI_KernelSU_SUSFS: c-gettimeofday fallback\n")
+            f.write("# CONFIG_GENERIC_GETTIMEOFDAY 未进最终 .config 时该变量为空，\n")
+            f.write("# 会让 vdso 与 vdso32 的 vgettimeofday.c 都拿不到类型/函数声明。\n")
+            f.write("# 回落到与官方 CONFIG=y 完全相同的文件，两个 arch 同时覆盖。\n")
             f.write("ifeq ($(c-gettimeofday-y),)\n")
-            f.write("CFLAGS_vgettimeofday.o += -include $(srctree)/lib/vdso/gettimeofday.c\n")
+            f.write("c-gettimeofday-y := $(GENERIC_VDSO_DIR)gettimeofday.c\n")
             f.write("endif\n")
-        self.manifest["vdso_include_added"] = True
-        logger.info("已为 vgettimeofday.o 补齐 -include $(srctree)/lib/vdso/gettimeofday.c")
+        self.manifest["vdso_gettimeofday_var_fixed"] = True
+        logger.info("已在 lib/vdso/Makefile 补齐 c-gettimeofday-y 回落（覆盖 vdso + vdso32）")
 
     def _dump_final_config(self):
         """编译前打印 .config 里关键 CONFIG 的真实值，便于定位配置层问题。
