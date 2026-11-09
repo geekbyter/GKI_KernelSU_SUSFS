@@ -117,6 +117,18 @@ CONFIG_KSU=y
 CONFIG_KPM=y
 CONFIG_KSU_SUSFS_SUS_SU=n
 
+# === 基础依赖（必须显式开启） ===
+# deprecated/android12-5.10-2025-05 的 gki_defconfig 未显式设置
+# CONFIG_KEYS；而 include/linux/key.h 里的 struct key 含成员
+# `struct assoc_array keys;`，assoc_array.h 又用
+# #ifdef CONFIG_ASSOCIATIVE_ARRAY 保护该结构体定义。
+# 一旦 CONFIG_KEYS 打开但 CONFIG_ASSOCIATIVE_ARRAY 没被 select，
+# arch/arm64/kernel/asm-offsets.s（prepare0 阶段）就会报
+# "field has incomplete type 'struct assoc_array'"。
+# 显式写 =y 与 CONFIG_KEYS 的 select 等价，无副作用。
+CONFIG_KEYS=y
+CONFIG_ASSOCIATIVE_ARRAY=y
+
 # === TMPFS Config ===
 CONFIG_TMPFS_XATTR=y
 CONFIG_TMPFS_POSIX_ACL=y
@@ -839,10 +851,13 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             errors = []
 
             def _on_line(line):
-                # 全部实时打印（Actions 日志能吃下），同时把错误行单独收集
+                # 全部实时打印（Actions 日志能吃下），同时把错误行单独收集。
+                # 注意：不要用宽泛的 "not found"——内核 Makefile 的 $(info)
+                # 里常有 "xxx not found, feature disabled" 这类无害提示，
+                # 会被误收进错误列表干扰判断。
                 logger.info(line)
                 if re.search(r'(?i)\berror\b|fatal error|undefined reference|'
-                             r'undeclared|No such file|not found|Error \d+', line):
+                             r'undeclared|No such file or directory|Error \d+', line):
                     errors.append(line)
 
             try:
