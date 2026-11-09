@@ -710,8 +710,10 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             f.write("\n# GKI_KernelSU_SUSFS: vdso -include fix\n")
             f.write("# CONFIG_GENERIC_GETTIMEOFDAY 未进最终 .config 时，\n")
             f.write("# $(c-gettimeofday-y) 为空，vgettimeofday.c 拿不到类型/函数声明。\n")
-            f.write("# 用 $(srctree) 绝对路径无条件注入，避免依赖配置。\n")
+            f.write("# 仅在该变量为空时补齐，避免与原有 -include 重复包含同一文件。\n")
+            f.write("ifeq ($(c-gettimeofday-y),)\n")
             f.write("CFLAGS_vgettimeofday.o += -include $(srctree)/lib/vdso/gettimeofday.c\n")
+            f.write("endif\n")
         self.manifest["vdso_include_added"] = True
         logger.info("已为 vgettimeofday.o 补齐 -include $(srctree)/lib/vdso/gettimeofday.c")
 
@@ -775,33 +777,28 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 f.write("CONFIG_DEFAULT_BBR=y\n")
 
         # ------------------------------------------------------------------
-        # 绝对不要删除 build.config.gki 里的 `POST_DEFCONFIG_CMDS="check_defconfig"`。
+        # 删除 POST_DEFCONFIG_CMDS="check_defconfig"（与原版一致）。
         #
-        # 原实现 `content.replace("check_defconfig", "")` 是为了绕过「往
-        # gki_defconfig 追加自定义 CONFIG 后 defconfig 校验报错」，但它带来
-        # 灾难性副作用：check_defconfig 是 GKI 官方流程里 make defconfig
-        # 之后负责把 Kconfig 的 select/default 结果固化进 .config 的关键步骤。
-        # 删掉它之后，最终 .config 里所有「被 select 但没在 gki_defconfig
-        # 显式写出」的基础配置全部丢失，例如：
-        #   CONFIG_ASSOCIATIVE_ARRAY   -> key.h 的 struct assoc_array 不完整
-        #   CONFIG_GENERIC_GETTIMEOFDAY-> vdso/vgettimeofday.c 缺 -include
-        # 表现为编译最早期（asm-offsets / vdso_prepare）连续报错，补一个
-        # 冒出下一个。逐条打头文件补丁是治标，这里才是根因。
+        # 2026-11-09 实测纠正：check_defconfig 并不会「固化 select 配置」，
+        # 它是把 `make savedefconfig` 的结果与 gki_defconfig 做 diff，
+        # 不一致就 `return 1` 直接终止构建：
+        #   ERROR: savedefconfig does not match gki_defconfig
+        # 因为我们往 gki_defconfig 追加了 CONFIG_KSU / CONFIG_KPM /
+        # CONFIG_KSU_SUSFS_* / ZRAM 等自定义项，savedefconfig 规范化时会
+        # 把它们精简掉，diff 必然不一致 -> 构建必挂。原版删掉它是正确的。
         #
-        # 自定义 CONFIG 通过 KSU/SUSFS 自带的 Kconfig 定义（CONFIG_KSU、
-        # CONFIG_KSU_SUSFS_* 等），make defconfig 会正常识别；把它们追加到
-        # gki_defconfig 只是显式固化，check_defconfig 不会因此报错。
-        # 若个别版本校验仍失败，正确做法是看 check_defconfig 的输出调整
-        # 具体 CONFIG，而不是把整个校验删掉。
+        # 至于 CONFIG_ASSOCIATIVE_ARRAY / CONFIG_GENERIC_GETTIMEOFDAY 缺失，
+        # 恢复 check_defconfig 后 .config 里依然缺失（实测），所以那两个
+        # 问题与它无关，已由 _fix_assoc_array_header() 和
+        # _fix_vdso_gettimeofday_include() 在源码层根治。
         # ------------------------------------------------------------------
         build_config = self.work_dir / "common/build.config.gki"
         if build_config.exists():
             content = build_config.read_text(errors="ignore")
-            if "check_defconfig" not in content:
-                logger.warning("build.config.gki 缺少 check_defconfig（上游可能已变更），"
-                               "基础配置可能丢失，请检查最终 .config")
-            else:
-                logger.info("保留 POST_DEFCONFIG_CMDS=check_defconfig（GKI 依赖它固化 select 配置）")
+            if "check_defconfig" in content:
+                content = content.replace("check_defconfig", "")
+                build_config.write_text(content)
+                logger.info("已跳过 check_defconfig（避免 savedefconfig diff 终止构建）")
 
     def _configure_zram(self):
         config_file = self.work_dir / "common/arch/arm64/configs/gki_defconfig"
