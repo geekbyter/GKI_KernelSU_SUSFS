@@ -502,13 +502,24 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 self._chdir(self.work_dir)
 
     def apply_sukisu_patches(self):
+        # 69_hide_stuff.patch（2024-12 老补丁）改的是 fs/proc/task_mmu.c 的
+        # show_map_vma / show_vma_header_prefix，与 susfs v2.3.0 的 task_mmu.c
+        # 补丁改的是同一段。两者叠加时 --fuzz=3 可能「蒙混过关」但留下悬空
+        # label / 未声明变量（例如它插入的 `goto done;` 在 v2.3.0 里已无对应
+        # 标签），编译阶段报一堆难定位的错。
+        # 它只是 maps 隐藏加固，不提供 root / KPM / SUSFS 核心能力，故默认跳过。
+        # 需要时把 APPLY_HIDE_STUFF_PATCH 设为 True 再显式启用。
+        APPLY_HIDE_STUFF_PATCH = False
+        if not APPLY_HIDE_STUFF_PATCH:
+            logger.info("=== 跳过 69_hide_stuff.patch（与 susfs v2.3.0 的 task_mmu.c 冲突） ===")
+            self.manifest["hide_stuff_patch_applied"] = False
+            return
         logger.info("=== 应用 SukiSU 补丁 ===")
         self._chdir(self.work_dir / "common")
         hooks_patch = self.sukisu_patch_dir / "69_hide_stuff.patch"
         if hooks_patch.exists():
-            # 69_hide_stuff.patch 是 2024-12 的老补丁，与 susfs v2.3.0 的
-            # task_mmu.c 改动可能冲突。冲突时中止，不再静默产出半修补的内核。
             self._run_cmd(f"cp {hooks_patch} . && patch -p1 -F 3 < 69_hide_stuff.patch", check=True)
+            self.manifest["hide_stuff_patch_applied"] = True
 
     def apply_zram_patches(self):
         if not self.config.use_zram:
@@ -541,24 +552,26 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             content = f.read()
 
         # ===== 修复 VMA_PAD_START 未定义 =====
+        # susfs v2.3.0 的 task_mmu.c hunk 用了 `end = VMA_PAD_START(vma);`，
+        # 但 5.10 内核源码里没有这个宏（它是较新内核才有的），编译会报
+        # 'VMA_PAD_START' undeclared。
+        #
+        # 原实现依赖 `#include <linux/pkeys.h>` 作为插入锚点：如果这个
+        # include 不存在（或 susfs 补丁正好改动了那段），inserted 会一直是
+        # False，宏定义从未被写入 -> 静默编译失败。这里改成不依赖任何锚点：
+        # 无条件把 #ifndef 保护的定义插到第一个 #include 之前，幂等且必定生效。
         if "VMA_PAD_START" in content and "#define VMA_PAD_START" not in content:
             logger.info("检测到 VMA_PAD_START 未定义，正在添加宏定义...")
-            # 在 #include <linux/pkeys.h> 之后添加定义
+            fix = ("// VMA_PAD_START fix for SUSFS (5.10 has no such macro)\n"
+                   "#ifndef VMA_PAD_START\n"
+                   "#define VMA_PAD_START(vma) ((vma)->vm_end)\n"
+                   "#endif\n")
             lines = content.split('\n')
-            new_lines = []
-            inserted = False
-            for line in lines:
-                new_lines.append(line)
-                if not inserted and line.strip().startswith('#include <linux/pkeys.h>'):
-                    new_lines.append('')
-                    new_lines.append('// VMA_PAD_START fix for SUSFS')
-                    new_lines.append('#ifndef VMA_PAD_START')
-                    new_lines.append('#define VMA_PAD_START(vma) ((vma)->vm_end)')
-                    new_lines.append('#endif')
-                    inserted = True
-            if inserted:
-                content = '\n'.join(new_lines)
-                logger.info("已添加 VMA_PAD_START 宏定义")
+            insert_at = next((i for i, l in enumerate(lines)
+                              if l.lstrip().startswith('#include')), 0)
+            lines.insert(insert_at, fix)
+            content = '\n'.join(lines)
+            logger.info(f"已在第 {insert_at + 1} 行前插入 VMA_PAD_START 宏定义")
 
         # ===== 修复 dentry 未初始化（如果还存在） =====
         if "struct dentry *dentry;" in content:
@@ -814,16 +827,36 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         try:
             if (self.work_dir / "build/build.sh").exists():
                 logger.info("使用旧版构建方式...")
-                result = self._run_cmd("LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC=\"/usr/bin/ccache clang\"", check=False)
+                cmd = "LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC=\"/usr/bin/ccache clang\""
             else:
                 logger.info("使用 Bazel 构建方式...")
-                result = self._run_cmd("tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast --lto=thin //common:kernel_aarch64_dist", check=False)
+                cmd = "tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast --lto=thin //common:kernel_aarch64_dist"
 
-            if result.returncode == 0:
-                logger.info("=== 内核编译成功 ===")
-                return True
-            logger.error(f"内核编译失败: {result.stderr if result.stderr else 'Unknown error'}")
-            return False
+            # 原实现用 _run_cmd(check=False) 且不 capture_output，失败时
+            # result.stderr 恒为 None -> 永远打印 "Unknown error"，真正的
+            # `error:` / `undefined reference` 被埋在上千行日志里看不到。
+            # 改为边跑边打印，并收集所有含 error/fatal/undefined 的行。
+            errors = []
+
+            def _on_line(line):
+                # 全部实时打印（Actions 日志能吃下），同时把错误行单独收集
+                logger.info(line)
+                if re.search(r'(?i)\berror\b|fatal error|undefined reference|'
+                             r'undeclared|No such file|not found|Error \d+', line):
+                    errors.append(line)
+
+            try:
+                # run_with_callback 成功返回输出字符串，失败抛 RuntimeError
+                self.shell.run_with_callback(cmd + " 2>&1", callback=_on_line)
+            except RuntimeError:
+                logger.error("=== 内核编译失败，收集到的错误行 ===")
+                for line in errors[-40:]:
+                    logger.error(line)
+                if not errors:
+                    logger.error("未捕获到显式 error 行，请查看上方完整构建日志")
+                return False
+            logger.info("=== 内核编译成功 ===")
+            return True
         except Exception as e:
             logger.error(f"编译过程出错: {e}")
             return False
