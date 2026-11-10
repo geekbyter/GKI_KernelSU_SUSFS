@@ -1406,7 +1406,7 @@ CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=n
                 cmd = "LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC=\"/usr/bin/ccache clang\""
             else:
                 logger.info("使用 Bazel 构建方式...")
-                cmd = "tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast --lto=thin //common:kernel_aarch64_dist"
+                cmd = ("tools/bazel build --disk_cache=$HOME/.cache/bazel --config=fast --lto=thin //common:kernel_aarch64_dist")
 
             # 原实现用 _run_cmd(check=False) 且不 capture_output，失败时
             # result.stderr 恒为 None -> 永远打印 "Unknown error"，真正的
