@@ -12,9 +12,13 @@ from dataclasses import dataclass, field
 from config import (BuildConfig, KSU_REPO_CONFIG, SUSFS_REPO_CONFIG, SUKISU_PATCH_REPO_CONFIG,
                    ANYKERNEL_CONFIG, KERNEL_PATCHES_CONFIG, BBG_CONFIG, TOOLCHAIN_CONFIG,
                    LEGACY_FIXES, OP8E_PATCH_URL, KPM_PATCH_URL, KPM_PATCH_SHA256,
-                   KPM_PATCH_UPSTREAM, KSU_MIN_UAPI_VERSION, RECOMMENDED_BOOT_VARIANT,
+                   KPM_PATCH_UPSTREAM, KPM_TOOLS_VERSION, KPM_KPTOOLS_URL,
+                   KPM_KPIMG_URL, KPM_KPTOOLS_SHA256, KPM_KPIMG_SHA256, KPM_SUPERKEY,
+                   KSU_MIN_UAPI_VERSION, RECOMMENDED_BOOT_VARIANT,
                    DISABLED_BOOT_VARIANTS, SUSFS_VERSION_LABEL, KSU_PIN,
-                   SUSFS_PIN, SUKISU_PATCH_PIN)
+                   SUSFS_PIN, SUKISU_PATCH_PIN, KSU_VERSION_PIN,
+                   KSU_MANAGER_TAG, KSU_MANAGER_BASE_COMMIT,
+                   MAGISKBOOT_URL, MAGISKBOOT_LIB, MAGISKBOOT_APK_SHA256)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -160,6 +164,25 @@ CONFIG_KSU_SUSFS_ENABLE_LOG=y
 CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
 CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
 CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+# builtin 分支无条件调用 susfs 的 priority_uid_filter 函数，而上游没给
+# 它 Kconfig 定义（见 _ensure_susfs_priority_uid_filter_kconfig）。
+# 这里显式开启，语义与 susfs 上游默认一致（default y）。
+# builtin 分支无条件调用 susfs 的 priority_uid_filter 函数，而上游没给
+# 它 Kconfig 定义（见 _ensure_susfs_priority_uid_filter_kconfig）。
+#
+# 2026-11-09 实测：默认**关闭**（=n）。原因：
+#   这个特性会让 susfs 在 kthread 上下文里 commit_creds() 并切换
+#   SELinux 域到 u:r:ksu:s0（fs/susfs.c 的 susfs_switch_to_ksu_domain），
+#   而 SukiSU builtin 的 pkg_observer.c 是**无条件**调用
+#   susfs_parse_priority_app_strings() 的 —— 没有 CONFIG 门控，
+#   所以只要这个 CONFIG 打开，ksu 的 fsnotify/task_work 路径就会触发
+#   改 creds + 切域，在 early 阶段有 oops 风险。
+#   WildKernels 上游对同类问题（older branches 没有该符号）的处理是
+#   把调用点编译掉（见其 susfs_guard_priority_helpers.py 注释）。
+#
+#   保留 =y 的能力（Kconfig 定义照旧补上，用户可自行在 defconfig 打开），
+#   但默认不启用，与 WildKernels 的实际行为一致。
+CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=n
 """
 
     ZRAM_CONFIG_5_10 = "CONFIG_ZSMALLOC=y\nCONFIG_ZRAM=y\nCONFIG_MODULE_SIG=n\nCONFIG_CRYPTO_LZO=y\nCONFIG_ZRAM_DEF_COMP_LZ4KD=y\n"
@@ -272,9 +295,22 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         repo_dir = self.workspace / "git-repo"
         repo_dir.mkdir(exist_ok=True)
         repo_path = repo_dir / "repo"
-        if not repo_path.exists():
-            self._run_cmd(f"curl https://storage.googleapis.com/git-repo-downloads/repo > {repo_path}", check=False)
-            self._run_cmd(f"chmod a+rx {repo_path}", check=False)
+        if not repo_path.exists() or repo_path.stat().st_size < 1024:
+            # 2026-11-10：原来 check=False 且无大小校验，curl 失败会留下 0 字节
+            # 文件、后续 $REPO init 报 "python: not found" 之类的迷惑错误。
+            self._run_cmd(
+                f"curl -fL --retry 3 --connect-timeout 30 --max-time 120 "
+                f"https://storage.googleapis.com/git-repo-downloads/repo -o {repo_path}",
+                check=True)
+            self._run_cmd(f"chmod a+rx {repo_path}", check=True)
+        if not repo_path.exists() or repo_path.stat().st_size < 1024:
+            raise RuntimeError(f"repo 工具下载失败或异常小: {repo_path}")
+        # repo 的 shebang 是 `#!/usr/bin/env python`，ubuntu-latest 上由
+        # python-is-python3 提供；这里显式探测，缺失时给出可操作的报错。
+        if self._run_cmd("command -v python >/dev/null 2>&1", check=False).returncode != 0:
+            raise RuntimeError(
+                "缺少 `python` 命令：repo 工具的 shebang 需要它。"
+                "请在 workflow 的 Install dependencies 里安装 python-is-python3")
         self.env["REPO"] = str(repo_path)
         self.shell.env = self.env
 
@@ -410,16 +446,28 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             KSU_VERSION = 40000 + count(main) - 2815；
           - main:kernel/Kbuild 与 userspace/ksud/build.rs 用完全相同的
             40000 - 2815 + rev-list --count HEAD(main)。
-        三者同源，官方值当前是 41151 (main 3966 commits)。
+        三者同源。
 
-        因此**绝不能**用 builtin 自身或 merge-base(builtin, main) 的提交数
-        去 override：那会算出 41865 / 41010，反而把正确的 41151 改坏，
-        正是 manager「显示未安装」的成因之一。
+        2026-11-09 本地实测的版本不匹配问题：
+          内核侧 count(main) 取的是**构建时刻** main 分支 HEAD，
+          manager 侧 count(HEAD) 取的是**构建 manager APK 时刻**的 main。
+          官方 release 资产名直接带版本号，实测最新为
+            v4.3.0-r2 -> SukiSU_v4.3.0-r2_41150-release.apk
+          而 tag v4.3.0-r2 (645ef986) 的 count=3965 -> 41150。
+          若不锚定，构建时 main 已前进到 count=3980 -> 41165，
+          manager 侧
+            HomeUiState.isVersionMismatch =
+              isManager && (kernelUAPIVersion != managerUAPIVersion ||
+                            ksuVersion != currentManagerVersionCode)
+          就会判定版本不匹配并弹警告。
 
-        唯一要防的是：detached + shallow clone 下本地 `main` ref 不存在，
-        且 GITHUB_COMMITS (GitHub API 限流) 为空时，Makefile 会掉到兜底
-        值 13000。做法是 unshallow 并显式 fetch main，让 `rev-list --count
-        main` 可用；公式本身保持内核原样。
+        对策（与 WildKernels/GKI_KernelSU_SUSFS 的 root-setup action 同一思路）：
+        把内核侧 KSU_VERSION 显式 override 成配套 manager 的 versionCode，
+        并把 KSU_VERSION_FULL 钉成配套 tag，标签化写入便于溯源。
+
+        绝不改公式本身：override 由 _override_ksu_version() 插入到
+        `ccflags-y += -DKSU_VERSION=` 之前（`:=` 立即展开，晚插无效），
+        且带幂等标记。
         """
         shallow = ksu_dir / ".git" / "shallow"
         if shallow.exists():
@@ -442,6 +490,68 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         else:
             logger.warning("无法数 main 提交数；若 GitHub API 也限流，KSU_VERSION 可能掉到 13000，"
                            "manager 会报版本不匹配 —— 请检查 BUILD_MANIFEST.txt")
+        self._override_ksu_version(ksu_dir)
+
+    def _override_ksu_version(self, ksu_dir: Path):
+        """把内核 KSU_VERSION 显式钉成配套 manager 的 versionCode。
+
+        与 WildKernels 的 root-setup action 同思路：不动上游公式，
+        只在 kernel/Makefile 的 `ccflags-y += -DKSU_VERSION=` 之前插入
+        `KSU_VERSION := <n>`，并写明来源，便于事后溯源。
+
+        幂等：已打过标记则跳过。
+        """
+        if not KSU_VERSION_PIN:
+            logger.info("未设置 KSU_VERSION_PIN，沿用内核自带版本启发式")
+            self.manifest["ksu_version_override"] = "disabled"
+            return
+        makefile = ksu_dir / "kernel" / "Makefile"
+        if not makefile.exists():
+            logger.warning(f"未找到 {makefile}，跳过 KSU_VERSION 锚定")
+            self.manifest["ksu_version_override"] = "makefile-missing"
+            return
+        content = makefile.read_text(errors="ignore")
+        marker = "# CI: deterministic KSU_VERSION (GKI_KernelSU_SUSFS)"
+        if marker in content:
+            logger.info("KSU_VERSION 已锚定，跳过")
+            self.manifest["ksu_version_override"] = "already-pinned"
+            return
+        # 必须确认上游确实有这两个变量，避免改名后盲目追加。
+        if "KSU_VERSION" not in content or "KSU_VERSION_FULL" not in content:
+            raise RuntimeError("kernel/Makefile 缺少 KSU_VERSION / KSU_VERSION_FULL，"
+                               "上游结构可能已变化，中止以免产出版本错乱的内核")
+        tag = KSU_MANAGER_TAG or "unknown"
+        # tag 自带 "v" 前缀（v4.3.0-r2），不要再叠一个 v
+        full = tag if tag.startswith("v") else f"v{tag}"
+        block_lines = [
+            marker,
+            "# 内核与 manager 的数字版本都来自 40000 - 2815 + rev-list --count，",
+            "# 但内核取构建时刻的 main HEAD、manager 取构建 APK 时刻的 HEAD，",
+            f"# 两者会随 main 前进而错位（实测 41165 vs {KSU_VERSION_PIN}）。",
+            "# 这里锚定到配套 manager release，使 kernelUAPIVersion/版本码一致。",
+            f"KSU_VERSION := {KSU_VERSION_PIN}",
+            f"KSU_VERSION_FULL := \"{full}\"",
+        ]
+        # 关键：`KSU_VERSION := ...` 是立即展开的；ccflags-y += -DKSU_VERSION=$(KSU_VERSION)
+        # 那一行一旦被解析，值就固定了。所以 override 必须插在它**之前**，
+        # 追加到文件末尾无效（2026-11-09 实测内核里仍是 41165）。
+        lines_mk = content.split("\n")
+        anchor_idx = None
+        for i, line in enumerate(lines_mk):
+            if line.strip().startswith("ccflags-y") and "-DKSU_VERSION=" in line:
+                anchor_idx = i
+                break
+        if anchor_idx is None:
+            raise RuntimeError(
+                "kernel/Makefile 里找不到 'ccflags-y += -DKSU_VERSION=' 锚点，"
+                "上游结构可能已变化，中止以免产出版本错乱的内核")
+        lines_mk[anchor_idx:anchor_idx] = block_lines + [""]
+        makefile.write_text("\n".join(lines_mk))
+        self.manifest.update(ksu_version_override="pinned",
+                             ksu_version_pinned=KSU_VERSION_PIN,
+                             ksu_version_manager_tag=tag,
+                             ksu_version_manager_base_commit=KSU_MANAGER_BASE_COMMIT)
+        logger.info(f"已把内核 KSU_VERSION 锚定为 {KSU_VERSION_PIN}（配套 manager {tag}）")
 
     def _setup_kernelsu_symlink(self, ksu_dir: Path):
         """等价于 setup.sh 的集成动作，但不做 clone/pull/checkout。"""
@@ -510,7 +620,45 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             patch_file = common_dir / self.config.get_susfs_patch_filename()
             if patch_file.exists():
                 self._chdir(common_dir)
-                self._run_cmd(f"patch -p1 --fuzz=3 < {patch_file}", check=True)  # SUSFS 补丁冲突必须显性失败
+
+                # 2026-11-10 实测（android13-5.15-189 真实构建失败）：
+                # Google 在较新 GKI sublevel 里删掉了 `<trace/hooks/*.h>` include
+                # 行，而 susfs4ksu 的补丁仍把它们当首个 hunk 的上下文，导致
+                #   fs/namespace.c Hunk #1 FAILED at 32
+                # 换 susfs 仓库 / 换分家族 pin 都无效（WildKernels 同 pin 的
+                # patch 上下文逐字相同）。WildKernels 的解法是打补丁前用
+                # susfs_restore_context.py 把缺失的 include 按补丁期望顺序补回，
+                # 头文件不存在时建空 stub（SUSFS 不用这些 trace hook 符号）。
+                # 实测：补 3 行后 patch rc=0、0 个 .rej。该脚本通用、幂等、无版本门槛。
+                # 脚本与 kernel_builder.py 同目录（.github/workflows/scripts/），
+                # 用 __file__ 定位，避免依赖 workspace 布局。
+                restore = Path(__file__).resolve().parent / "susfs_restore_context.py"
+                if restore.exists():
+                    self._run_cmd(
+                        f"python3 {restore} {patch_file.name} {common_dir}", check=True)
+                    self.manifest["susfs_context_restored"] = True
+                else:
+                    logger.warning("未找到 susfs_restore_context.py，跳过上下文恢复（新 sublevel 可能补丁失败）")
+
+                # 补丁应用（不再用 --fuzz=3：WildKernels 用裸 patch -p1，且
+                # 明确不用 --forward，避免 reversed/already-applied hunk 被跳过）。
+                r = self._run_cmd(f"patch -p1 < {patch_file.name}",
+                                  check=False, capture_output=True)
+                out = (r.stdout or "") + (r.stderr or "")
+                for line in out.splitlines():
+                    logger.info(line)
+                if r.returncode != 0:
+                    rejects = list(common_dir.rglob("*.rej"))
+                    logger.error(
+                        f"SUSFS 补丁应用失败（rc={r.returncode}），"
+                        f"失败的 hunk 文件: {[str(x.relative_to(common_dir)) for x in rejects]}")
+                    for rej in rejects[:5]:
+                        logger.error(f"--- {rej.relative_to(common_dir)} ---")
+                        for line in rej.read_text(errors="ignore").splitlines()[:24]:
+                            logger.error(f"    {line}")
+                    raise RuntimeError(
+                        "SUSFS 补丁应用失败（上下文恢复后仍不匹配），中止构建。"
+                        "请查看上方 .rej 内容定位具体 hunk")
                 self._chdir(self.work_dir)
 
     def apply_sukisu_patches(self):
@@ -564,26 +712,42 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             content = f.read()
 
         # ===== 修复 VMA_PAD_START 未定义 =====
-        # susfs v2.3.0 的 task_mmu.c hunk 用了 `end = VMA_PAD_START(vma);`，
-        # 但 5.10 内核源码里没有这个宏（它是较新内核才有的），编译会报
-        # 'VMA_PAD_START' undeclared。
+        # susfs v2.3.0 的 task_mmu.c hunk 用了 `end = VMA_PAD_START(vma);`。
         #
-        # 原实现依赖 `#include <linux/pkeys.h>` 作为插入锚点：如果这个
-        # include 不存在（或 susfs 补丁正好改动了那段），inserted 会一直是
-        # False，宏定义从未被写入 -> 静默编译失败。这里改成不依赖任何锚点：
-        # 无条件把 #ifndef 保护的定义插到第一个 #include 之前，幂等且必定生效。
+        # 2026-11-09 本地实测纠正：deprecated/android12-5.10-2025-05 树里
+        # **本来就有** 这个宏：
+        #   include/linux/pgsize_migration_inline.h:45
+        #   #define VMA_PAD_START(vma) (vma->vm_end - (vma_pad_pages(vma) << PAGE_SHIFT))
+        # 它是 16KB page size 支持的后移植（mm/pgsize_migration.c 在用），
+        # 由 include/linux/pgsize_migration.h 引入。
+        #
+        # 上一版无条件往 task_mmu.c 里插一份自己的定义，于是同一个 TU 里
+        # 出现两份 VMA_PAD_START -> 编译报：
+        #   include/linux/pgsize_migration_inline.h:45:9: error:
+        #   'VMA_PAD_START' macro redefined [-Werror,-Wmacro-redefined]
+        #
+        # 正确做法：只在整棵树里都找不到该宏时才补兜底定义；
+        # 已经存在就什么都不做（不能覆盖内核自带的 16KB 语义）。
         if "VMA_PAD_START" in content and "#define VMA_PAD_START" not in content:
-            logger.info("检测到 VMA_PAD_START 未定义，正在添加宏定义...")
-            fix = ("// VMA_PAD_START fix for SUSFS (5.10 has no such macro)\n"
-                   "#ifndef VMA_PAD_START\n"
-                   "#define VMA_PAD_START(vma) ((vma)->vm_end)\n"
-                   "#endif\n")
-            lines = content.split('\n')
-            insert_at = next((i for i, l in enumerate(lines)
-                              if l.lstrip().startswith('#include')), 0)
-            lines.insert(insert_at, fix)
-            content = '\n'.join(lines)
-            logger.info(f"已在第 {insert_at + 1} 行前插入 VMA_PAD_START 宏定义")
+            kernel_has_macro = self._tree_defines_vma_pad_start()
+            if kernel_has_macro:
+                logger.info("内核树已自带 VMA_PAD_START（16KB page support），不再注入兜底定义")
+                self.manifest["vma_pad_start_macro"] = "kernel-provided"
+            else:
+                logger.info("检测到 VMA_PAD_START 未定义，正在添加宏定义...")
+                fix = ("// VMA_PAD_START fix for SUSFS (5.10 has no such macro)\n"
+                       "#ifndef VMA_PAD_START\n"
+                       "#define VMA_PAD_START(vma) ((vma)->vm_end)\n"
+                       "#endif\n")
+                lines = content.split('\n')
+                insert_at = next((i for i, l in enumerate(lines)
+                                  if l.lstrip().startswith('#include')), 0)
+                lines.insert(insert_at, fix)
+                content = '\n'.join(lines)
+                logger.info(f"已在第 {insert_at + 1} 行前插入 VMA_PAD_START 宏定义")
+                self.manifest["vma_pad_start_macro"] = "injected-fallback"
+        elif "#define VMA_PAD_START" in content:
+            self.manifest["vma_pad_start_macro"] = "already-defined"
 
         # ===== 修复 dentry 未初始化（如果还存在） =====
         if "struct dentry *dentry;" in content:
@@ -615,6 +779,256 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 content = content.replace("goto show_pad;", "return 0;")
                 with open(task_mmu, "w") as f:
                     f.write(content)
+
+    def _tree_defines_vma_pad_start(self) -> bool:
+        """整棵内核树里是否已经有 VMA_PAD_START 的定义。
+
+        2026-11-09 实测：deprecated/android12-5.10-2025-05 已经有
+        include/linux/pgsize_migration_inline.h 提供该宏（16KB page 支持），
+        此时再往 task_mmu.c 注入一份会触发 macro-redefined 编译错误。
+        """
+        common = self.work_dir / "common"
+        if not common.is_dir():
+            return False
+        for rel in ("include/linux/pgsize_migration_inline.h",
+                    "include/linux/pgsize_migration.h",
+                    "include/linux/mm_types.h",
+                    "include/linux/mm.h"):
+            p = common / rel
+            if not p.exists():
+                continue
+            try:
+                if "#define VMA_PAD_START" in p.read_text(errors="ignore"):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _ensure_susfs_priority_uid_filter_kconfig(self):
+        """补上 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER 的 Kconfig 定义。
+
+        2026-11-09 本地实测发现的真实上游缺口：
+          - susfs v2.3.0 (b0e4746) 的 fs/susfs.c 里实现了
+            susfs_set_priority_uid_filter() / susfs_parse_priority_app_strings()，
+            include/linux/susfs.h 里的声明被
+                #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER
+            包着；
+          - 该 Kconfig 定义**只**存在于 susfs 的
+            kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+            （那是给「独立 KernelSU 仓库」路线用的），GKI 路线用的
+            50_add_susfs_in_gki-*.patch 里没有；
+          - SukiSU-Ultra 的 builtin 分支在提交 a864d15a
+            ("susfs: Add priority uid filter & kernel & KernelSU: Sync with upstream")
+            里**无条件**调用了这两个函数，却同样没加 Kconfig 定义 ——
+            全分支扫描确认 builtin 是唯一「有调用、无定义」的组合，
+            也就是说 builtin 分支自身在未提供该 CONFIG 时编译不过：
+
+                drivers/kernelsu/manager/pkg_observer.c:24:5: error:
+                  implicit declaration of function 'susfs_parse_priority_app_strings'
+                drivers/kernelsu/supercall/dispatch.c:478:13: error:
+                  implicit declaration of function 'susfs_set_priority_uid_filter'
+
+        修法：把上游在 10_enable_susfs_for_ksu.patch 里用的那段 Kconfig
+        原文照搬到 KSU 的 Kconfig（同一个 menu 内、同样的 depends on 与
+        default），这样该功能变成可配置项，语义与 susfs 上游完全一致。
+        幂等：已存在则跳过。
+        """
+        kconfig = self.work_dir / "common" / "drivers" / "kernelsu" / "Kconfig"
+        if not kconfig.exists():
+            logger.warning(f"未找到 {kconfig}，跳过 PRIORITY_UID_FILTER Kconfig 修复")
+            self.manifest["susfs_priority_uid_filter_kconfig"] = "kconfig-missing"
+            return
+        content = kconfig.read_text(errors="ignore")
+        if "config KSU_SUSFS_PRIORITY_UID_FILTER" in content:
+            logger.info("Kconfig 已有 KSU_SUSFS_PRIORITY_UID_FILTER 定义，跳过")
+            self.manifest["susfs_priority_uid_filter_kconfig"] = "already-present"
+            return
+        block = (
+            "config KSU_SUSFS_PRIORITY_UID_FILTER\n"
+            "\tbool \"Enable to allow adding user-defined uids that will be hidden from getpriority/setpriority/ioprio_get/ioprio_set syscall\"\n"
+            "\tdepends on KSU_SUSFS\n"
+            "\tdefault y\n"
+            "\thelp\n"
+            "\t  - Allow hiding user-defined uids from syscalls like getpriority/setpriority/ioprio_get/ioprio_set.\n"
+            "\t  - Effective on all processes with uid >= 10000.\n"
+            "\n"
+        )
+        # 插到 KSU_SUSFS_SUS_MAP 之后（最后一个 susfs 子选项）的 endmenu 之前，
+        # 与 susfs 上游 10_enable_susfs_for_ksu.patch 的插入位置一致。
+        anchor = "config KSU_SUSFS_SUS_MAP"
+        idx = content.find(anchor)
+        if idx < 0:
+            logger.warning("Kconfig 里找不到 config KSU_SUSFS_SUS_MAP，未插入 PRIORITY_UID_FILTER")
+            self.manifest["susfs_priority_uid_filter_kconfig"] = "anchor-missing"
+            return
+        # 从 anchor 起找该 config 块的结尾（下一个顶层 config 或 endmenu）
+        rest = content[idx:]
+        m = re.search(r'\nendmenu\n', rest)
+        if not m:
+            logger.warning("Kconfig 结构异常（未找到 endmenu），未插入 PRIORITY_UID_FILTER")
+            self.manifest["susfs_priority_uid_filter_kconfig"] = "structure-unknown"
+            return
+        insert_at = idx + m.start() + 1
+        new_content = content[:insert_at] + block + content[insert_at:]
+        kconfig.write_text(new_content)
+        self.manifest["susfs_priority_uid_filter_kconfig"] = "inserted"
+        logger.info("已在 KSU Kconfig 中补上 KSU_SUSFS_PRIORITY_UID_FILTER 定义")
+
+    def _guard_susfs_credential_helpers(self):
+        """把 susfs.c 里两个 credential helper 的定义也用同一个 CONFIG 门控。
+
+        2026-11-09 实测（与 WildKernels 的 susfs_guard_priority_helpers.py 同一问题）：
+
+          susfs v2.3.0 的 fs/susfs.c 把
+              static struct cred *susfs_switch_to_ksu_domain(void)   // 第 183 行
+              static void susfs_restore_creds(struct cred *)          // 第 217 行
+          的**定义**放在了 `#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER`
+          块**外面**，而它们的唯一调用点在块**里面**。
+          于是当该 CONFIG 关闭时（我们默认关闭，见 KERNEL_CONFIG_TEMPLATE）：
+              fs/susfs.c:183:21: error: unused function 'susfs_switch_to_ksu_domain'
+              fs/susfs.c:217:13: error: unused function 'susfs_restore_creds'
+          —— GKI 用 -Werror 把死代码变成编译错误。
+
+          修法与 WildKernels 上游一致：把这两个定义包进同一个 #ifdef。
+          CONFIG 打开时行为完全不变；关闭时定义随调用点一起消失。
+
+          幂等：已门控则跳过。
+        """
+        f = self.work_dir / "common" / "fs" / "susfs.c"
+        if not f.exists():
+            logger.warning("未找到 fs/susfs.c，跳过 credential helper 门控")
+            self.manifest["susfs_credential_helpers_guarded"] = "file-missing"
+            return
+        content = f.read_text(errors="ignore")
+        if "credential helpers */" in content:
+            logger.info("susfs.c: credential helpers 已门控，跳过")
+            self.manifest["susfs_credential_helpers_guarded"] = "already-guarded"
+            return
+
+        GUARD = "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n"
+        ENDIF = "#endif // #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER /* credential helpers */\n"
+        SWITCH_SIG = "static struct cred *susfs_switch_to_ksu_domain(void) {"
+        RESTORE_SIG = "static void susfs_restore_creds(struct cred *orig_cred) {"
+
+        if SWITCH_SIG not in content:
+            logger.info("susfs.c: credential helpers 不存在（无需处理）")
+            self.manifest["susfs_credential_helpers_guarded"] = "not-present"
+            return
+        if RESTORE_SIG not in content:
+            logger.warning("susfs.c: 找不到 susfs_restore_creds 定义，无法门控")
+            self.manifest["susfs_credential_helpers_guarded"] = "restore-sig-missing"
+            return
+
+        # 找到 restore 函数定义的右花括号结束位置
+        brace = content.find("{", content.find(RESTORE_SIG))
+        depth = 0
+        i = brace
+        end = -1
+        while i < len(content):
+            if content[i] == "{":
+                depth += 1
+            elif content[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+            i += 1
+        if end < 0:
+            logger.warning("susfs.c: 花括号不配对，无法门控")
+            self.manifest["susfs_credential_helpers_guarded"] = "unbalanced-braces"
+            return
+
+        # 找到 switch 函数的文档注释起点（紧邻其上方的 /* ... */）
+        doc_marker = " * Switches the selinux domain of the current process to the KernelSU one"
+        doc = content.find(doc_marker)
+        if doc > 0:
+            start = content.rfind("/*", 0, doc)
+        else:
+            start = content.rfind("/*", 0, content.find(SWITCH_SIG))
+        if start < 0:
+            start = content.find(SWITCH_SIG)
+
+        new_content = (content[:end] + "\n" + ENDIF + content[end:])
+        new_content = (new_content[:start] + GUARD + new_content[start:])
+
+        # 校验：guard 必须包住两个定义
+        g = new_content.find(GUARD)
+        s_i = new_content.find(SWITCH_SIG)
+        r_i = new_content.find(RESTORE_SIG)
+        e_i = new_content.find(ENDIF)
+        if not (0 <= g < s_i < r_i < e_i):
+            raise RuntimeError("susfs.c: 门控写入后校验失败，中止以免产出更坏的内核")
+        f.write_text(new_content)
+        self.manifest["susfs_credential_helpers_guarded"] = True
+        logger.info("已把 susfs.c 的 credential helpers 包进 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER")
+
+    def _guard_ksu_priority_uid_filter_calls(self):
+        """把 KSU 侧对 susfs priority_uid_filter 的调用点也用 CONFIG 门控。
+
+        2026-11-09 实测发现的上游缺口（与 WildKernels 的处理一致）：
+          SukiSU-Ultra builtin 分支在提交 a864d15a 里**无条件**调用了
+          susfs_parse_priority_app_strings()（kernel/manager/pkg_observer.c）
+          和 susfs_set_priority_uid_filter()（kernel/supercall/dispatch.c），
+          但这两个函数在 susfs 侧被
+              #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER
+          包着。于是：
+            - CONFIG 打开  -> 特性生效，但 susfs 会在 kthread 上下文
+                              commit_creds() 并切 SELinux 域到 u:r:ksu:s0，
+                              而 pkg_observer 的调用没有 CONFIG 门控，
+                              在 early boot 阶段有 oops 风险；
+            - CONFIG 关闭  -> susfs.h 里的声明不可见，
+                              编译报 implicit declaration（我们最初撞到的）。
+
+          正确做法（也是 WildKernels susfs_guard_priority_helpers.py 的思路）：
+          把 **调用点** 也放进同一个 #ifdef，两边一致地开/关。
+          这样 CONFIG=n 时整个特性从编译中消失，行为与 WildKernels 一致；
+          CONFIG=y 时功能完整可用。
+
+          幂等：已加过门控则跳过。
+        """
+        targets = [
+            ("drivers/kernelsu/manager/pkg_observer.c",
+             "susfs_parse_priority_app_strings();"),
+            ("drivers/kernelsu/supercall/dispatch.c",
+             "susfs_set_priority_uid_filter(arg);"),
+        ]
+        changed = []
+        for rel, call in targets:
+            f = self.work_dir / "common" / rel
+            if not f.exists():
+                logger.warning(f"未找到 {rel}，跳过 priority_uid_filter 调用门控")
+                continue
+            content = f.read_text(errors="ignore")
+            if call not in content:
+                continue
+            # 已经门控过？（前一行是 #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER）
+            lines_c = content.split("\n")
+            done = False
+            for i, l in enumerate(lines_c):
+                if l.strip() == call.strip():
+                    prev = lines_c[i - 1].strip() if i > 0 else ""
+                    if prev.startswith("#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER"):
+                        done = True
+                    break
+            if done:
+                continue
+            out = []
+            for l in lines_c:
+                if l.strip() == call.strip():
+                    indent = l[:len(l) - len(l.lstrip())]
+                    out.append(f"{indent}#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER")
+                    out.append(l)
+                    out.append(f"{indent}#endif // #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER")
+                else:
+                    out.append(l)
+            f.write_text("\n".join(out))
+            changed.append(rel)
+        if changed:
+            self.manifest["ksu_priority_uid_filter_calls_guarded"] = changed
+            logger.info(f"已给 KSU 侧的 priority_uid_filter 调用加 CONFIG 门控: {changed}")
+        else:
+            self.manifest["ksu_priority_uid_filter_calls_guarded"] = "already-guarded-or-absent"
+            logger.info("KSU 侧 priority_uid_filter 调用门控：无需改动")
 
     def _fix_assoc_array_header(self):
         """让 struct assoc_array 无条件完整，根治 asm-offsets 的 incomplete type。
@@ -741,7 +1155,8 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             return
         keys = ("CONFIG_KEYS", "CONFIG_ASSOCIATIVE_ARRAY",
                 "CONFIG_GENERIC_GETTIMEOFDAY", "CONFIG_KSU", "CONFIG_KPM",
-                "CONFIG_KSU_SUSFS", "CONFIG_HEADERS_INSTALL")
+                "CONFIG_KSU_SUSFS", "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER",
+                "CONFIG_HEADERS_INSTALL")
         lines = cfg.read_text(errors="ignore").split("\n")
         logger.info(f"=== 最终 .config 关键项（{cfg}） ===")
         for k in keys:
@@ -1030,9 +1445,54 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             logger.error(f"编译过程出错: {e}")
             return False
 
+    def _kernel_dist_dir(self) -> Path:
+        """定位内核 Image 产物目录。
+
+        不再按 android_version 硬编码：build_kernel() 用 build/build.sh 时产物在
+        out/<android>-<kernel>/dist，用 Bazel 时在 bazel-bin/common/kernel_aarch64。
+        旧实现把 android14/15 一律指向 bazel 路径，与 build_kernel() 的实际分支
+        不一致，会导致 patch_kpm_image / prepare_boot_images 找不到 Image。
+        这里按实际存在的 Image 探测，兼容两种布局。
+        """
+        candidates = [
+            self.work_dir / f"out/{self.config.android_version}-{self.config.kernel_version}/dist",
+            self.work_dir / "bazel-bin/common/kernel_aarch64",
+            self.work_dir / "out" / "dist",
+        ]
+        for d in candidates:
+            if (d / "Image").exists():
+                logger.info(f"内核产物目录: {d}")
+                return d
+        for d in self.work_dir.rglob("Image"):
+            if d.is_file() and d.stat().st_size > 1024 * 1024:
+                logger.warning(f"内核产物目录由宽搜得到: {d.parent}")
+                return d.parent
+        raise RuntimeError(
+            "找不到内核 Image 产物；build_kernel() 可能未成功产出，"
+            "或产物路径与已知布局都不同")
+
     def patch_kpm_image(self):
-        """给 kernel Image 注入 KernelPatch (kpimg)。CONFIG_KPM=y 只是桥接层，
-        运行时还需要 Image 被打过补丁，否则 kpm version 返回 -EOPNOTSUPP。"""
+        """给 kernel Image 注入 KernelPatch (kpimg)，用官方 kptools + 配对 kpimg。
+
+        2026-11-10 实测根因与修法（设备 logo 阶段无限重启）：
+          旧实现下载裸 patch_linux 后无参数执行 ./patch。该二进制内嵌的 kpimg
+          资源是坏的（1 字节 -> 补成 16 字节 `aa 00...`），却仍照常改写了
+          ARM64 Image 头：把 stext 的 b 分支指向 0x262e000（**越出文件 3952 字节**）、
+          把 image_size 头改成 0x262f000、把 tcp_init_sock 区域 NOP 掉 0x2000 字节。
+          内核第一条分支就跳到文件外 -> logo 无限重启，而日志一路 [+] 全绿。
+
+          官方 SukiSU_KernelPatch_patch 的正确用法是 kptools 显式带 kpimg：
+            kptools-linux -p -i Image -k kpimg -s <superkey> -o out
+          本次用 0.14.0 release 的配对资产，产出 version=0xe00 /
+          compile_time=19:40:23 Oct 26 2026 / config=android,release，
+          实机验证：正常开机且 sukisu 工具识别到 KPM（2026-11-10）。
+
+        硬校验（防止再静默产出坏镜像）：
+          1) kptools / kpimg 都从同一 release 下载并做 sha256 校验；
+          2) 打补丁后用 kptools -l 读回元信息，version 必须 != 0 且 compile_time 非空；
+          3) **解码 ARM64 Image 头的 b 指令**，确认跳转目标落在文件内；
+          4) 确认输出比输入大（真的写进了 kpimg，不是只改了头）。
+        """
         if not self.config.use_kpm:
             self.manifest.update(kpm_patched=False, kpm_skip_reason="use_kpm=false")
             return
@@ -1042,37 +1502,128 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             logger.warning("=== 跳过 KPM 补丁 (6.6 已知稳定性问题) ===")
             return
 
-        logger.info("=== 修补 Image 文件 (KPM) ===")
-        self._chdir(self.work_dir)
-        if self.config.android_version in ["android12", "android13"]:
-            image_dir = self.work_dir / f"out/{self.config.android_version}-{self.config.kernel_version}/dist"
-        else:
-            image_dir = self.work_dir / "bazel-bin/common/kernel_aarch64"
-        if not image_dir.exists():
-            raise RuntimeError(f"KPM: 找不到内核产物目录 {image_dir}")
+        logger.info("=== 修补 Image 文件 (KPM / 官方 kptools) ===")
+        image_dir = self._kernel_dist_dir()
 
         self._chdir(image_dir)
-        patch_path = image_dir / "patch"
-        self._run_cmd(f"curl -fL --retry 3 -Ss {KPM_PATCH_URL} -o patch", check=True)
-        if not patch_path.exists() or patch_path.stat().st_size < 1024:
-            raise RuntimeError("KPM: 补丁下载失败或文件异常小")
-        digest = _sha256_file(patch_path)
-        logger.info(f"KPM patch sha256: {digest}")
-        self.manifest.update(kpm_patch_url=KPM_PATCH_URL, kpm_patch_sha256=digest,
+        image = image_dir / "Image"
+        if not image.exists():
+            raise RuntimeError(f"KPM: 找不到 {image}")
+
+        kptools = image_dir / "kptools-linux"
+        kpimg = image_dir / "kpimg"
+
+        # --- 0) 前置校验（借鉴 MikSU kpm_image.rs 的自检链） ---
+        # 基线必须是未打补丁的干净内核，否则重复注入会产出坏镜像。
+        base = image.read_bytes()
+        if len(base) < 64 or base[56:60] != b"ARMd":
+            raise RuntimeError(f"KPM 自检: {image.name} 不是有效的 ARM64 Image")
+        b0 = int.from_bytes(base[4:8], "little")
+        if (b0 & 0xFC000000) != 0x14000000:
+            raise RuntimeError(
+                f"KPM 自检: 基线 Image @0x04 不是 b 指令 (0x{b0:08x})，"
+                "可能已被打过补丁，拒绝重复注入")
+        if b"KP1158" in base:
+            raise RuntimeError("KPM 自检: 基线 Image 已含 KP1158 magic，拒绝重复注入")
+        self.manifest["kpm_baseline_size"] = len(base)
+
+        # --- 1) 下载官方配对资产并校验 ---
+        for url, path, expect in ((KPM_KPTOOLS_URL, kptools, KPM_KPTOOLS_SHA256),
+                                  (KPM_KPIMG_URL, kpimg, KPM_KPIMG_SHA256)):
+            self._run_cmd(f"curl -fL --retry 3 -Ss {url} -o {path.name}", check=True)
+            if not path.exists() or path.stat().st_size < 100 * 1024:
+                raise RuntimeError(f"KPM: {path.name} 下载失败或异常小")
+            digest = _sha256_file(path)
+            logger.info(f"KPM {path.name} sha256: {digest}")
+            if expect and digest.lower() != expect.lower():
+                raise RuntimeError(f"KPM: {path.name} sha256 不匹配: 期望 {expect} 实际 {digest}")
+        self._run_cmd(f"chmod 755 {kptools.name}", check=True)
+        self.manifest.update(kpm_tools_version=KPM_TOOLS_VERSION,
+                             kpm_kptools_sha256=_sha256_file(kptools),
+                             kpm_kpimg_sha256=_sha256_file(kpimg),
                              kpm_patch_upstream=KPM_PATCH_UPSTREAM)
-        if KPM_PATCH_SHA256:
-            if digest.lower() != KPM_PATCH_SHA256.lower():
-                raise RuntimeError(f"KPM 补丁 sha256 不匹配: 期望 {KPM_PATCH_SHA256} 实际 {digest}")
-            self.manifest["kpm_patch_sha256_verified"] = True
-        else:
-            self.manifest["kpm_patch_sha256_verified"] = False
-        self._run_cmd("chmod 755 patch && ./patch", check=True)
-        oimage = image_dir / "oImage"
-        if not oimage.exists() or oimage.stat().st_size < 1024 * 1024:
-            raise RuntimeError("KPM: patch 未生成有效 oImage，中止（避免产出未打补丁的内核）")
-        self._run_cmd("rm -f patch && mv oImage Image", check=True)
+        # 官方 tag 0.14.0 树内 version 其实是 0.13.9（子代理调研确认），
+        # 因此版本配对必须用 kptools 实读值，不能按 release tag 名断言。
+        for label, args in (("kpm_kptools_version", f"./{kptools.name} -v"),
+                            ("kpm_kpimg_version_reported",
+                             f"./{kptools.name} -v -k {kpimg.name}")):
+            rv = self._run_cmd(args, check=False, capture_output=True)
+            val = ((rv.stdout or "") + (rv.stderr or "")).strip().splitlines()
+            v = val[-1] if val else ""
+            self.manifest[label] = v
+            logger.info(f"KPM {label}: {v}")
+
+        # --- 2) 用官方命令打补丁 ---
+        orig_size = image.stat().st_size
+        patched = image_dir / "Image.kpm"
+        superkey = os.environ.get("KPM_SUPERKEY") or KPM_SUPERKEY
+        self._run_cmd(
+            f"./{kptools.name} -p -i {image.name} -k {kpimg.name} "
+            f"-s {superkey} -o {patched.name}", check=True)
+        if not patched.exists() or patched.stat().st_size <= orig_size:
+            raise RuntimeError("KPM: 打补丁后输出异常（未变大或缺失），中止")
+        logger.info(f"KPM 补丁输出 {orig_size} -> {patched.stat().st_size} bytes")
+
+        # --- 3) 读回 kpimg 元信息 ---
+        info = self._run_cmd(f"./{kptools.name} -l -i {patched.name}",
+                             check=True, capture_output=True)
+        text = (info.stdout or "") + (info.stderr or "")
+        ver = next((l.split("=", 1)[1] for l in text.splitlines()
+                    if l.strip().startswith("version=")), "")
+        ctime = next((l.split("=", 1)[1] for l in text.splitlines()
+                      if l.strip().startswith("compile_time=")), "")
+        patched_flag = "patched=true" in text
+        logger.info(f"KPM kpimg: patched={patched_flag} version={ver} compile_time={ctime}")
+        if not patched_flag or not ver or ver in ("0", "0x0") or not ctime.strip():
+            raise RuntimeError(
+                f"KPM: kpimg 元信息异常（version={ver!r}, compile_time={ctime!r}）—— "
+                "很可能注入了损坏/空壳 kpimg，中止以免产出无法启动的内核")
+        self.manifest.update(kpm_kpimg_version=ver, kpm_kpimg_compile_time=ctime)
+
+        # --- 4) 解码 ARM64 Image 头，确认 b 分支跳转目标在文件内 ---
+        self._verify_arm64_entry(patched)
+
+        # --- 5) 原子替换 ---
+        self._run_cmd(f"mv -f {patched.name} {image.name}", check=True)
         self.manifest["kpm_patched"] = True
-        logger.info("=== KPM 补丁已应用 ===")
+        logger.info("=== KPM 补丁已应用并通过全部校验 ===")
+
+    @staticmethod
+    def _verify_arm64_entry(path: Path):
+        """解码 ARM64 Image 头 @0x04 的 b 指令，确认跳转目标落在文件内。
+
+        这是 2026-11-10 那次 logo 无限重启的直接致命点：
+        坏镜像把 b 目标改到 0x262e000，而文件只到 0x262d090（越界 3952 字节）。
+        """
+        import struct
+        d = path.read_bytes()
+        if len(d) < 64:
+            raise RuntimeError(f"KPM 自检: {path.name} 太短，不是有效内核镜像")
+        if d[56:60] != b"ARMd":
+            raise RuntimeError(f"KPM 自检: {path.name} 缺少 ARM64 magic (0x38)")
+        code1 = struct.unpack_from("<I", d, 4)[0]
+        # ARM64 b <imm26>: opcode 0x14000000, target = PC(0x04) + sext(imm26)<<2
+        if (code1 & 0xFC000000) != 0x14000000:
+            # 不是 b 指令就不做跳转校验（有些镜像头布局不同），只记录
+            logger.warning(f"KPM 自检: @0x04 不是 b 指令 (0x{code1:08x})，跳过跳转校验")
+            return
+        imm = code1 & 0x03FFFFFF
+        if imm & 0x02000000:
+            imm -= 0x04000000
+        target = 0x04 + (imm << 2)
+        in_file = target < len(d)
+        nonzero = sum(1 for x in d[target:target + 4096] if x) if in_file else 0
+        logger.info(f"KPM 自检: b->0x{target:x}, file=0x{len(d):x}, "
+                    f"in_file={in_file}, code@target={nonzero} non-zero bytes")
+        if not in_file:
+            raise RuntimeError(
+                f"KPM 自检失败: ARM64 入口 b 指令跳到 0x{target:x}，"
+                f"但镜像只有 0x{len(d):x} 字节（越界 {target - len(d)} 字节）—— "
+                "这种镜像刷入必然 logo 无限重启，构建中止")
+        if nonzero < 64:
+            raise RuntimeError(
+                f"KPM 自检失败: b 目标 0x{target:x} 在文件内但几乎是空的"
+                f"（前 4KB 仅 {nonzero} 字节非零），kpimg 可能未写入，构建中止")
 
     def prepare_boot_images(self) -> list:
         logger.info("=== 准备启动镜像 ===")
@@ -1081,40 +1632,226 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         bootimgs_dir.mkdir(exist_ok=True)
         artifacts = []
 
-        if self.config.android_version in ["android12", "android13"]:
-            image_source = self.work_dir / f"out/{self.config.android_version}-{self.config.kernel_version}/dist"
-        else:
-            image_source = self.work_dir / "bazel-bin/common/kernel_aarch64"
+        image_source = self._kernel_dist_dir()
 
         for image_name in ["Image", "Image.lz4"]:
             src = image_source / image_name
             if src.exists():
                 self._run_cmd(f"cp {src} {bootimgs_dir}/ && cp {src} {self.work_dir}/", check=False)
 
+        # 2026-11-09：patch_kpm_image() 会把 dist/Image 换成打过 KPM 补丁的版本
+        # （`mv oImage Image`）。上面的 cp 必须发生在它之后，boot 镜像里装的
+        # 才是带 kpimg 的内核，否则 KPM 运行时永远返回 -EOPNOTSUPP。
+        # 这里再显式同步一次，并记录实际大小便于事后核对。
+        patched = image_source / "Image"
+        if patched.exists():
+            self._run_cmd(f"cp -f {patched} {bootimgs_dir}/Image && cp -f {patched} {self.work_dir}/Image", check=False)
+            self.manifest["boot_image_kernel_size"] = patched.stat().st_size
+            logger.info(f"boot 镜像内核大小 = {patched.stat().st_size} bytes")
+
         if (self.work_dir / "Image").exists():
             self._run_cmd("gzip -n -k -f -9 Image", check=False)
 
-        if self.config.android_version == "android12":
-            self._prepare_android12_boot_images(bootimgs_dir, artifacts)
+        # 2026-11-10 产物规则：5.10 / 5.15 产 boot*.img + AnyKernel3.zip；
+        # 6.1 / 6.6 只产 AnyKernel3.zip（见 BuildConfig.produces_boot_img 注释）。
+        if self.config.produces_boot_img():
+            self._prepare_boot_images_with_template(bootimgs_dir, artifacts)
         else:
-            self._prepare_boot_images_generic(bootimgs_dir, artifacts)
+            logger.info(
+                f"{self.config.android_version}-{self.config.kernel_version}: "
+                "按规则只产 AnyKernel3.zip，跳过 boot*.img（通用 mkbootimg 打包器"
+                "无 ramdisk / 硬编码 os_version 12 / 无 VBMETA，产出残缺镜像）")
+            self.manifest["boot_img_policy"] = "anykernel3-zip-only"
         return artifacts
 
-    def _prepare_android12_boot_images(self, bootimgs_dir: Path, artifacts: list):
+    def _prepare_boot_images_with_template(self, bootimgs_dir: Path, artifacts: list):
+        """用 Google certified boot 镜像作模板 + magiskboot 打包 boot*.img。
+
+        原实现把 URL 硬编码成 android12-5.10；现按
+        `gki-certified-boot-<android>-<kernel>-<os_patch>_<revision>.zip` 拼，
+        5.10 与 5.15 都实测 200。revision 缺省时回退 r1。
+        """
         self._chdir(bootimgs_dir)
-        gki_url = f"https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-{self.config.os_patch_level}_{self.config.revision}.zip"
-        fallback_url = "https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-2023-01_r1.zip"
-        result = subprocess.run(f"curl -sL -w '%{{http_code}}' {gki_url} -o /dev/null", shell=True, capture_output=True, text=True)
+        av = self.config.android_version
+        kv = self.config.kernel_version
+        pat = self.config.os_patch_level
+        rev = (self.config.revision or "").strip() or "r1"
+        gki_url = (f"https://dl.google.com/android/gki/"
+                   f"gki-certified-boot-{av}-{kv}-{pat}_{rev}.zip")
+        fallback_url = (f"https://dl.google.com/android/gki/"
+                        f"gki-certified-boot-{av}-{kv}-2023-01_r1.zip")
+        result = subprocess.run(
+            f"curl -sL -w '%{{http_code}}' {gki_url} -o /dev/null",
+            shell=True, capture_output=True, text=True)
         url = gki_url if "200" in result.stdout else fallback_url
-        self._run_cmd(f"curl -Lo gki-kernel.zip {url} && unzip -o gki-kernel.zip && rm gki-kernel.zip", check=False)
-        boot_img_path = bootimgs_dir / "boot-5.10.img"
-        if boot_img_path.exists():
-            self._run_cmd(f"$UNPACK_BOOTIMG --boot_img={boot_img_path}", check=False)
+        if url != gki_url:
+            logger.warning(f"certified boot 主 URL 不可用，回退到 {fallback_url}")
+        # 2026-11-10：加超时与显式校验。旧实现 check=False 且无 --max-time，
+        # 网络挂起时会静默卡住数分钟，且下载到 0 字节也被吞掉。
+        self._run_cmd(
+            f"curl -fL --retry 3 --connect-timeout 30 --max-time 300 -o gki-kernel.zip {url}",
+            check=True)
+        zip_path = bootimgs_dir / "gki-kernel.zip"
+        if not zip_path.exists() or zip_path.stat().st_size < 1024 * 1024:
+            raise RuntimeError(f"Google certified boot zip 下载失败或异常小: {zip_path}")
+        self._run_cmd("unzip -o gki-kernel.zip && rm gki-kernel.zip", check=True)
+        # 模板镜像按内核版本命名（boot-5.10.img / boot-5.15.img / boot-5.10-lts.img ...）。
+        # 只用 `boot-<内核版本>*.img` 匹配，避免把上一次构建残留在 bootimgs_dir
+        # 里的 `*-boot-gz.img` 之类产物误当成模板。
+        pattern = f"boot-{kv}*.img"
+        candidates = [p for p in bootimgs_dir.glob(pattern)
+                      if "boot-gz" not in p.name and "boot-lz4" not in p.name]
+        # 精确名（boot-5.10.img / boot-5.15.img）优先，避免同名 lts 变体
+        # （boot-5.10-lts.img）在字典序里排到前面被误选。
+        exact = bootimgs_dir / f"boot-{kv}.img"
+        if exact in candidates and exact.stat().st_size > 1024 * 1024:
+            boot_img_path = exact
+        else:
+            boot_img_path = next(
+                (p for p in sorted(candidates) if p.stat().st_size > 1024 * 1024), None)
+        if boot_img_path is None:
+            # 兜底：有些包里就叫 boot.img（不带版本号）
+            fallback = bootimgs_dir / "boot.img"
+            if fallback.exists() and fallback.stat().st_size > 1024 * 1024:
+                boot_img_path = fallback
+        if boot_img_path is None:
+            raise RuntimeError(
+                f"未在 certified boot zip 里找到有效模板镜像"
+                f"（匹配 {pattern}，候选: {[p.name for p in bootimgs_dir.glob('boot*.img')]}），"
+                "中止以免产出无法启动的 boot 镜像")
+        logger.info(f"certified boot 模板: {boot_img_path.name}")
+        # 2026-11-09：改用 magiskboot 打包路径。
+        # 原先用 mkbootimg --header_version 4 生成，它在没有 --gki_signing_key 时
+        # 不写 boot signature 槽（boot_signature_size=0），magiskboot 解析时
+        # 也看不到 VBMETA 块 -> 设备 bootloader 拒绝 -> 无限重启。
+        # magiskboot 以这份 certified boot 镜像为模板 unpack/repack，
+        # header / ramdisk / boot_signature / os_patch_level 全部沿用原厂。
+        if self._build_boot_images_with_magiskboot(bootimgs_dir, artifacts, boot_img_path):
+            return
+        logger.warning("magiskboot 不可用，回退到 mkbootimg（可能无法启动）")
+        self._run_cmd(f"$UNPACK_BOOTIMG --boot_img={boot_img_path}", check=False)
         self._create_boot_image_variants(bootimgs_dir, artifacts, has_ramdisk=True)
 
-    def _prepare_boot_images_generic(self, bootimgs_dir: Path, artifacts: list):
-        self._chdir(bootimgs_dir)
-        self._create_boot_image_variants(bootimgs_dir, artifacts, has_ramdisk=False)
+    def _setup_magiskboot(self) -> bool:
+        """下载并解出 magiskboot。返回是否可用。
+
+        2026-11-09 实测：boot image v4 的正确打包器。
+        AOSP mkbootimg 在没有 --gki_signing_key 时不写 boot signature 槽，
+        而设备 bootloader 需要它 -> 无限重启。magiskboot 保留该槽。
+        """
+        import platform
+        arch = platform.machine()
+        lib = MAGISKBOOT_LIB.get("x86_64" if arch in ("x86_64", "amd64") else "aarch64")
+        if not lib:
+            logger.warning(f"magiskboot: 不支持的架构 {arch}")
+            return False
+        tool = self.work_dir / "magiskboot"
+        if tool.exists() and tool.stat().st_size > 1024:
+            self.env["MAGISKBOOT"] = str(tool)
+            return True
+        apk = self.work_dir / "magisk.apk"
+        self._run_cmd(f"curl -fL --retry 3 -Ss {MAGISKBOOT_URL} -o {apk}", check=False)
+        if not apk.exists() or apk.stat().st_size < 1024 * 1024:
+            logger.warning("magiskboot: Magisk APK 下载失败")
+            return False
+        if MAGISKBOOT_APK_SHA256:
+            digest = _sha256_file(apk)
+            if digest.lower() != MAGISKBOOT_APK_SHA256.lower():
+                raise RuntimeError(
+                    f"Magisk APK sha256 不匹配: 期望 {MAGISKBOOT_APK_SHA256} 实际 {digest}")
+            logger.info(f"Magisk APK sha256 校验通过 ({digest[:16]}...)")
+        self._run_cmd(f"unzip -o -j {apk} '{lib}' -d {self.work_dir}", check=False)
+        extracted = self.work_dir / "libmagiskboot.so"
+        # 注意：不同 Magisk 版本里 magiskboot 的大小差别很大
+        # （实测 v30.7 的 x86_64 版只有 943,848 字节，v28 的 1.38 MB），
+        # 用 1 MB 当阈值会误判「解出失败」。这里只要求它是个像样的二进制。
+        if not extracted.exists() or extracted.stat().st_size < 100 * 1024:
+            logger.warning(f"magiskboot: 无法从 APK 解出 {lib}")
+            return False
+        self._run_cmd(f"cp {extracted} {tool} && chmod 755 {tool}", check=False)
+        # 冒烟测试：能打印用法说明才算可用
+        r = self._run_cmd(f"{tool} 2>&1 | head -3", check=False, capture_output=True)
+        probe = (r.stdout or "") + (r.stderr or "")
+        if "MagiskBoot" not in probe:
+            logger.warning(f"magiskboot: 冒烟测试失败（{probe.strip()[:120]}）")
+            return False
+        self.env["MAGISKBOOT"] = str(tool)
+        logger.info(f"magiskboot 就绪: {tool}")
+        return True
+
+    def _build_boot_images_with_magiskboot(self, bootimgs_dir: Path, artifacts: list,
+                                            stock_boot: Path):
+        """用 magiskboot 以「Google 官方 certified boot 镜像」为模板打包。
+
+        2026-11-09 实测根因与修法：
+          原实现用 AOSP mkbootimg --header_version 4 生成 boot.img，
+          它在没有 --gki_signing_key 时 **不写 boot signature 槽**
+          （boot_signature_size = 0），magiskboot 解析时也看不到 VBMETA 块。
+          设备 bootloader 校验失败 -> 「能开机但立刻重启」。
+          实测 magiskboot 对 Google 官方 certified boot 镜像原样 repack 是
+          byte-identical（md5 相同），说明它完整保留 header 语义；
+          而 AnyKernel3 之所以能开机，正是因为它在设备上用 magiskboot
+          重打包了设备自己的 boot.img。
+
+          本实现：把 Google 的 boot-5.10.img 当模板，用 magiskboot
+          unpack 出组件，再把 kernel 换成我们的（可选 gzip / raw），
+          然后 repack。header / ramdisk / boot_signature / os_patch_level
+          全部沿用原厂，等价于 AnyKernel3 的效果，但产物在 PC 上就能生成。
+        """
+        if not self._setup_magiskboot():
+            return False
+        work = self.work_dir / "mb_pack"
+        if work.exists():
+            self._run_cmd(f"rm -rf {work}", check=False)
+        work.mkdir(parents=True, exist_ok=True)
+
+        r = self._run_cmd(f"cd {work} && cp {stock_boot} stock.img && "
+                          f"$MAGISKBOOT unpack -h stock.img", check=False, capture_output=True)
+        mb_out = (r.stdout or "") + (r.stderr or "")
+        if "VBMETA" not in mb_out:
+            raise RuntimeError(
+                "magiskboot unpack 模板后没有 VBMETA 块：模板不是有效的 boot image v4，"
+                "中止以免产出同样会无限重启的镜像")
+        if not (work / "kernel").exists():
+            raise RuntimeError("magiskboot unpack 未产出 kernel 组件")
+
+        src_image = self.work_dir / "Image"
+        if not src_image.exists():
+            raise RuntimeError(f"缺少 {src_image}，无法打包 boot 镜像")
+        logger.info(f"使用内核 {src_image} ({src_image.stat().st_size} bytes)")
+
+        variants = []
+        gz = self.work_dir / "Image.gz"
+        if gz.exists():
+            variants.append(("boot-gz.img", gz))
+        variants.append(("boot.img", src_image))
+
+        for output_file, kernel_path in variants:
+            self._run_cmd(f"cp {kernel_path} {work}/kernel", check=False)
+            self._run_cmd(f"cd {work} && rm -f out.img && $MAGISKBOOT repack stock.img out.img",
+                          check=True)
+            produced = work / "out.img"
+            if not produced.exists() or produced.stat().st_size < 1024 * 1024:
+                raise RuntimeError(f"magiskboot repack 未产出有效镜像: {output_file}")
+            dest = self.work_dir / (f"{self.config.android_version}-{self.config.kernel_version}."
+                                    f"{self.config.sub_level}-{self.config.os_patch_level}-{output_file}")
+            self._run_cmd(f"cp {produced} {dest}", check=True)
+            artifacts.append(str(dest))
+            logger.info(f"已生成 {dest.name}（magiskboot 打包，保留 boot signature / VBMETA）")
+
+        for a in artifacts:
+            if not a.endswith(".img"):
+                continue
+            r = self._run_cmd(f"$MAGISKBOOT unpack -h {a}", check=False, capture_output=True)
+            mb_out = (r.stdout or "") + (r.stderr or "")
+            if "VBMETA" not in mb_out:
+                raise RuntimeError(
+                    f"自检失败：{Path(a).name} 缺少 VBMETA/boot signature 块，"
+                    "该镜像会被设备 bootloader 拒绝 -> 无限重启")
+        self.manifest["boot_image_packer"] = "magiskboot"
+        self.manifest["boot_image_vbmeta_verified"] = True
+        logger.info("=== boot 镜像自检通过（VBMETA 块存在）===")
+        return True
 
     def _create_boot_image_variants(self, bootimgs_dir: Path, artifacts: list, has_ramdisk: bool = False):
         self._chdir(bootimgs_dir)
@@ -1129,7 +1866,22 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             if has_ramdisk:
                 cmd += f" --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level {self.config.os_patch_level}"
             self._run_cmd(cmd, check=False)
-            self._run_cmd(f"$AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image {output_file} --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH", check=False)
+            # 只有提供了设备私钥才做 AVB 签名。
+            # 原实现无条件调用，`$BOOT_SIGN_KEY_PATH` 为空时命令变成
+            # "--key "（空参数），avbtool 报
+            #   "add_hash_footer: error: argument --key: expected one argument"
+            # 并在日志里刷三行 usage 噪音。check=False 掩盖了失败，镜像本身
+            # 仍会产出（设备已禁用校验时本就靠 bootloader 放行），但这是
+            # 真实的错误输出，必须在无密钥时干脆不调用。
+            sign_key = os.environ.get("BOOT_SIGN_KEY_PATH", "").strip()
+            if sign_key:
+                self._run_cmd(
+                    f"$AVBTOOL add_hash_footer --partition_name boot "
+                    f"--partition_size $((64 * 1024 * 1024)) --image {output_file} "
+                    f"--algorithm SHA256_RSA2048 --key {sign_key}", check=False)
+            else:
+                logger.info(f"未提供 BOOT_SIGN_KEY_PATH，跳过 {output_file} 的 AVB 哈希页签名")
+                self.manifest.setdefault("avb_signed", []).append(f"{output_file}:skipped-no-key")
             dest = self.work_dir / f"{self.config.android_version}-{self.config.kernel_version}.{self.config.sub_level}-{self.config.os_patch_level}-{output_file}"
             self._run_cmd(f"cp {output_file} {dest}", check=False)
             artifacts.append(str(dest))
@@ -1141,6 +1893,13 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         ak3_dir = self.anykernel_dir
 
         # 实际文件是 Image.lz4 / Image.gz（点号）；原连字符写法让 lz4/gz 包成死分支
+        #
+        # 2026-11-09：每个 zip 只放**一种**内核，不要同时放 Image 和 Image.gz。
+        # AnyKernel3 的 flash_boot() 按固定顺序找内核：
+        #     for i in zImage zImage-dtb Image Image-dtb Image.gz Image.gz-dtb ...
+        # `Image` 排在 `Image.gz` 前面，所以一旦两个都在，AnyKernel3 永远选
+        # 裸 Image —— 「-gz 包用 gzip 内核」这个预期不成立。
+        # 分成三个 zip 时每个包只有一个内核文件，选择顺序不再有歧义。
         for suffix, file_suffix in [("", ""), ("-lz4", ".lz4"), ("-gz", ".gz")]:
             image_file = f"Image{file_suffix}"
             image_path = self.work_dir / image_file
@@ -1149,9 +1908,17 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             zip_name = f"{self.config.android_version}-{self.config.kernel_version}.{self.config.sub_level}-{self.config.os_patch_level}-AnyKernel3{suffix}.zip"
             self._run_cmd(f"cp {image_path} {ak3_dir}/", check=False)
             self._chdir(ak3_dir)
-            self._run_cmd(f"zip -r ../{zip_name} ./*", check=False)
+            # 2026-11-09 实测修正：原来用 `zip -r ../{zip_name} ./*`，
+            # 但当前目录是 workspace 下的 AnyKernel3/，`..` 指向 **workspace 根**，
+            # 而不是 work_dir。结果 zip 落在 workspace 根目录，而下面
+            # artifacts.append() 记录的是 work_dir 下的路径 —— 两者对不上，
+            # manifest 与 build_result.json 里的路径是错的，
+            # 收产物阶段也会漏掉这些 zip。
+            # 改为显式绝对路径，保证 zip 与 manifest 记录一致。
+            zip_path = self.work_dir / zip_name
+            self._run_cmd(f"zip -r {zip_path} ./*", check=False)
             self._run_cmd(f"rm {ak3_dir}/{image_file}", check=False)
-            artifacts.append(str(self.work_dir / zip_name))
+            artifacts.append(str(zip_path))
             self._chdir(self.work_dir)
         return artifacts
 
@@ -1182,6 +1949,16 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             #   vdso/Makefile -> 无条件 -include（vdso_prepare）
             self._fix_assoc_array_header()
             self._fix_vdso_gettimeofday_include()
+            # builtin 分支无条件调用 susfs 的 priority_uid_filter 函数，
+            # 但上游没给它 Kconfig 定义 -> 补上，否则编译器报
+            # implicit declaration（详见 _ensure_susfs_priority_uid_filter_kconfig）。
+            self._ensure_susfs_priority_uid_filter_kconfig()
+            # KSU 侧的调用点也要用同一个 CONFIG 门控，否则 CONFIG=n 时会
+            # 因为声明不可见而编译失败（见 _guard_ksu_priority_uid_filter_calls）。
+            self._guard_ksu_priority_uid_filter_calls()
+            # susfs.c 里两个 credential helper 的定义在 #ifdef 块外，
+            # CONFIG 关闭时变成死代码 -> -Werror=unused-function 编译失败。
+            self._guard_susfs_credential_helpers()
 
             if not self.build_kernel():
                 return BuildResult(success=False, config=self.config, message="内核编译失败", build_time=time.time() - start_time)
@@ -1204,8 +1981,12 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
 
     def _write_manifest(self, artifacts: list):
         """BUILD_MANIFEST.txt：内核/manager/SUSFS/KPM 各依赖的真实 commit。"""
-        self.manifest["recommended_variant"] = RECOMMENDED_BOOT_VARIANT
-        self.manifest["disabled_variants"] = list(DISABLED_BOOT_VARIANTS)
+        if self.config.produces_boot_img():
+            self.manifest["recommended_variant"] = RECOMMENDED_BOOT_VARIANT
+            self.manifest["disabled_variants"] = list(DISABLED_BOOT_VARIANTS)
+        else:
+            self.manifest["recommended_variant"] = "AnyKernel3.zip"
+            self.manifest["disabled_variants"] = ["boot*.img（本家族按规则不产出）"]
         self.manifest["artifacts"] = [Path(a).name for a in artifacts]
         out = self.work_dir / "BUILD_MANIFEST.txt"
         with open(out, "w", encoding="utf-8") as f:
@@ -1218,23 +1999,41 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
 
     def _verify_artifacts(self, artifacts: list):
         """宁可构建失败，也不产出「看起来成功」的残缺镜像。"""
+        zips = [Path(a) for a in artifacts if a.endswith(".zip")]
+        for z in zips:
+            if not z.exists() or z.stat().st_size < 1024:
+                raise RuntimeError(
+                    f"自检失败：{z.name} 缺失或异常小 —— 生成 zip 的命令失败过"
+                    "（检查环境是否有 zip 命令），却仍被写进产物清单")
+        if not zips:
+            raise RuntimeError("自检失败：没有产出任何 AnyKernel3 zip")
+
+        # 2026-11-10：6.1 / 6.6 按规则只产 AnyKernel3.zip，不校验 boot*.img。
         boots = [Path(a) for a in artifacts if a.endswith(".img") and "boot" in Path(a).name]
-        if not boots:
-            raise RuntimeError("自检失败：没有产出任何 boot*.img")
-        for img in boots:
-            if not img.exists() or img.stat().st_size < 1024 * 1024:
-                raise RuntimeError(f"自检失败：{img.name} 缺失或异常小")
-        if not [i for i in boots if i.name.endswith("-boot-gz.img")]:
-            raise RuntimeError("自检失败：缺少 boot-gz.img（本机唯一可启动压缩格式）")
+        if self.config.produces_boot_img():
+            if not boots:
+                raise RuntimeError("自检失败：本家族应产 boot*.img，但一个都没有")
+            for img in boots:
+                if not img.exists() or img.stat().st_size < 1024 * 1024:
+                    raise RuntimeError(f"自检失败：{img.name} 缺失或异常小")
+            if not [i for i in boots if i.name.endswith("-boot-gz.img")]:
+                raise RuntimeError("自检失败：缺少 boot-gz.img（本机唯一可启动压缩格式）")
+            avbtool = self.env.get("AVBTOOL", "")
+            if avbtool and Path(avbtool).exists() and self.env.get("BOOT_SIGN_KEY_PATH"):
+                for img in boots:
+                    if self._run_cmd(f"{avbtool} info_image --image {img}", check=False).returncode != 0:
+                        logger.warning(f"AVB footer 校验未通过: {img.name}（设备已禁用校验时可忽略）")
+        else:
+            if boots:
+                raise RuntimeError(
+                    f"自检失败：{self.config.android_version}-{self.config.kernel_version} "
+                    f"按规则只应产 AnyKernel3.zip，却出现了 boot*.img: "
+                    f"{[b.name for b in boots]}")
+
         image_gz = self.work_dir / "Image.gz"
         if image_gz.exists() and self._run_cmd(f"gzip -t {image_gz}", check=False).returncode != 0:
             raise RuntimeError("自检失败：Image.gz 不是有效 gzip 文件")
-        avbtool = self.env.get("AVBTOOL", "")
-        if avbtool and Path(avbtool).exists() and self.env.get("BOOT_SIGN_KEY_PATH"):
-            for img in boots:
-                if self._run_cmd(f"{avbtool} info_image --image {img}", check=False).returncode != 0:
-                    logger.warning(f"AVB footer 校验未通过: {img.name}（设备已禁用校验时可忽略）")
         if self.config.use_kpm and self.config.kernel_version != "6.6" and not self.manifest.get("kpm_patched"):
             raise RuntimeError("自检失败：启用 KPM 但补丁未标记成功")
-        logger.info(f"=== 产物自检通过：{len(boots)} 个 boot 镜像 ===")
+        logger.info(f"=== 产物自检通过：{len(boots)} 个 boot 镜像 / {len(zips)} 个 zip ===")
 

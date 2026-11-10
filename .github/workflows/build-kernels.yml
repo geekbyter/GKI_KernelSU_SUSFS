@@ -115,8 +115,18 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update && sudo apt upgrade -y
-          sudo apt install -y ccache python3 git curl wget zip unzip xz-utils openssl pixz
+          # 与 kernel-build.yml 保持一致：build/build.sh 需要 bc/bison/flex/
+          # libssl-dev/libelf-dev；repo 的 shebang 需要 `python` 命令
+          # （ubuntu-latest 只有 python3 -> python-is-python3）。
+          sudo apt install -y ccache python3 python-is-python3 git curl wget \
+            zip unzip xz-utils openssl pixz bc bison flex libssl-dev libelf-dev rsync
           pip install PyYAML
+          python --version
+          python3 --version
+          for c in bc bison flex gcc make unzip zip gzip; do
+            command -v "$c" >/dev/null || { echo "缺少 $c" >&2; exit 1; }
+          done
+          echo "依赖校验通过"
 
       # 可选：BOOT_SIGN_KEY 未配置时不设 BOOT_SIGN_KEY_PATH，产物无 AVB footer。
       - name: Setup AVB signing key (optional)

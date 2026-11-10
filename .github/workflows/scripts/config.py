@@ -83,6 +83,32 @@ KSU_PIN = "1cfa57340590971cba7521ed536da8ebbedc5f0a"
 SUSFS_PIN = "b0e474642cf77ee797004a454fa441362723d0ba"
 SUKISU_PATCH_PIN = "eec45788c9a115e5498040298133336d6b6071dd"
 
+# ---------------------------------------------------------------------------
+# manager 版本锚点
+#
+# 内核与 manager 的「数字版本」都来自 40000 - 2815 + rev-list --count，
+# 但取的 ref 不同：
+#   内核 kernel/Makefile : count(main)          <- 构建时刻 main 分支 HEAD
+#   manager build.gradle : count(HEAD of main)  <- 构建 manager APK 时刻
+# 官方 release 的资产名直接带版本号，实测：
+#   v4.3.0-r2 -> SukiSU_v4.3.0-r2_41150-release.apk
+#   tag v4.3.0-r2 (commit 645ef986) count=3965 -> 40000-2815+3965 = 41150
+#
+# 若不锚定，内核会算到 count(main)=3980 -> 41165，与 manager 的 41150 不等，
+# manager 的 HomeUiState.isVersionMismatch 就会判定版本不匹配并弹警告。
+#
+# 做法与 WildKernels/GKI_KernelSU_SUSFS 的 root-setup action 一致：
+# 显式 override 内核侧 KSU_VERSION，使内核数字版本 == 配套 manager 的版本码。
+# 留空字符串 = 不覆盖，沿用内核自带的启发式（会随 main 漂移）。
+# ---------------------------------------------------------------------------
+# 官方 manager release tag（决定配套 APK 的 versionCode）
+KSU_MANAGER_TAG = "v4.3.0-r2"
+# 该 tag 在 main 上的提交（count=3965 -> version 41150）
+KSU_MANAGER_BASE_COMMIT = "645ef9860b9b7f900bb5d1b27e224f2c311d39c0"
+# 显式钉住内核 KSU_VERSION（= 配套 manager 的 versionCode）。
+# 设为 "" 则不覆盖。
+KSU_VERSION_PIN = 41150
+
 KSU_REPO_CONFIG = {
     "repo_url": "https://github.com/SukiSU-Ultra/SukiSU-Ultra.git",
     "branch": "builtin",
@@ -122,20 +148,72 @@ OP8E_PATCH_URL = "https://github.com/zzh20188/GKI_KernelSU_SUSFS/raw/refs/heads/
 
 # ---------------------------------------------------------------------------
 # KPM 补丁：给编译出的 kernel Image 注入 KernelPatch (kpimg)，使得
-# SukiSU-Ultra 的 kernel/extension/kpm/bridge.h (Kernel-only ABI v2) 能工作。
+# SukiSU-Ultra 的 kernel/extension/kpm/bridge.h (Kernel-only ABI) 能工作。
 #
-# 注意三件事：
-#   1) CONFIG_KPM=y 只是编译进「桥接层」，运行时还需要内核 Image 被打过补丁，
-#      否则 sukisu_kpm_bridge() 的 PROBE 会 -EOPNOTSUPP，manager 显示 KPM 未修补。
-#   2) 补丁二进制必须与内核侧 bridge.h 的 ABI v2 同源。8 月之前的旧补丁是旧 ABI，
-#      与新版内核不兼容。KPM_PATCH_SHA256 留空表示跳过校验（不推荐），
-#      填入后可防止上游被替换/下载到损坏文件。
-#   3) 该二进制是预编译 ELF，下载后直接执行；务必保证来源可信。
+# 2026-11-10 实测根因（设备 logo 阶段无限重启，第 5 次才定位）：
+#   旧实现下载 ShirkNeko/SukiSU_patch 的**裸 patch_linux** 后无参数执行 ./patch。
+#   该二进制的内嵌 kpimg 资源是坏的（res_kpimg_enc 仅 1 字节 {0x00}，解密后
+#   补成 16 字节 `aa 00...` 垃圾），但它仍照常改写了内核：
+#     未打补丁: len=0x262c37c, b->0x1f50000 (文件内), image_size=0x2600000
+#     旧补丁  : len=0x262d090, b->0x262e000 (【越出文件 3952 字节】),
+#               image_size=0x262f000, 且把 tcp_init_sock 区域 NOP 掉 0x2000 字节
+#   内核第一条分支就跳到文件外 -> logo 无限重启，而日志一路 [+] 全绿。
+#
+#   官方 SukiSU_KernelPatch_patch 的 kptools 需要 -k 显式指定配套 kpimg：
+#     kptools-linux -p -i Image -k kpimg -s <superkey> -o out
+#   用 0.14.0 release 的配对 kpimg 得到 version=0xe00、
+#   compile_time=19:40:23 Oct 26 2026、config=android,release，
+#   b 目标 0x262e000 落在文件内且该处有 3450 字节真实代码。
+#   实机结果：刷该版后正常开机，sukisu 工具识别到 KPM（2026-11-10 用户确认）。
+#
+# 因此改为「官方 release 配对的 kptools + kpimg」，二者版本必须一致。
 # ---------------------------------------------------------------------------
-KPM_PATCH_URL = "https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/refs/heads/main/kpm/patch_linux"
-# 官方同源补丁仓库（剪裁自 bmax121/KernelPatch，专供 SukiSU-Ultra KPM）：
+KPM_TOOLS_VERSION = "0.14.0"
+KPM_RELEASE_BASE = ("https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/"
+                    "releases/download/" + KPM_TOOLS_VERSION)
+KPM_KPTOOLS_URL = KPM_RELEASE_BASE + "/kptools-linux"
+KPM_KPIMG_URL = KPM_RELEASE_BASE + "/kpimg"
 KPM_PATCH_UPSTREAM = "https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch"
-KPM_PATCH_SHA256 = ""   # 可选：填 64 位 hex 后构建会强制校验下载文件
+# 2026-11-10 实测 sha256。构建时强制校验，防止上游被替换或下载到截断文件。
+KPM_KPTOOLS_SHA256 = "a6b912ca964d35427d7fbcd87273abac604970e9746fa0613362be971f07259d"
+KPM_KPIMG_SHA256 = "ab020f31ca1c058603917e46d8a6691fbce0dd5cdc135a9cd8dc780e89472716"
+# superkey 只用于 KernelPatch 自身鉴权，不是设备密钥；可用环境变量 KPM_SUPERKEY 覆盖。
+KPM_SUPERKEY = "sukisu"
+# 兼容旧 manifest 字段名（已废弃的无参数 patch_linux 不再使用）。
+KPM_PATCH_URL = KPM_KPTOOLS_URL
+KPM_PATCH_SHA256 = KPM_KPIMG_SHA256
+
+# ---------------------------------------------------------------------------
+# magiskboot：boot image v4 的正确打包器
+#
+# 2026-11-09 实测（Redmi Note 11 Pro 5G / mt6895 / android12-5.10）根因：
+#   用 AOSP mkbootimg --header_version 4 打出来的 boot.img **没有 boot
+#   signature 槽**（mkbootimg.py 里：
+#       if args.header_version >= 4:
+#           boot_signature_size = 0
+#           if should_add_legacy_gki_boot_signature(args):   # 需要 --gki_signing_key
+#               boot_signature_size = BOOT_IMAGE_V4_SIGNATURE_SIZE
+#   没有 --gki_signing_key 就是 0），magiskboot 解析时也看不到 VBMETA 块。
+#   设备 bootloader 校验失败 -> 「能开机但立刻重启」的无限重启。
+#
+#   而同一内核经 AnyKernel3（magiskboot 在设备上重打包设备自己的 boot.img）
+#   可以正常启动 —— 因为 magiskboot 保留了 v4 的 boot signature / VBMETA 槽。
+#
+#   实测：magiskboot 对 Google 官方 certified boot 镜像原样 repack 是
+#   byte-identical（md5 相同），说明它完整保留了 header 语义。
+#
+# 因此打包路径改为 magiskboot：以 Google certified boot 镜像为模板，
+# 只替换 kernel，header / ramdisk / boot_signature / os_patch_level 全保留。
+# ---------------------------------------------------------------------------
+MAGISKBOOT_URL = "https://github.com/topjohnwu/Magisk/releases/download/v30.7/Magisk-v30.7.apk"
+# Magisk APK 里 magiskboot 的路径（按 ABI 分）
+MAGISKBOOT_LIB = {
+    "x86_64": "lib/x86_64/libmagiskboot.so",
+    "aarch64": "lib/arm64-v8a/libmagiskboot.so",
+}
+# Magisk APK 的 sha256（2026-11-09 实测下载 v30.7 所得）。
+# 留空则不校验；填上后构建会强制比对，防止上游 APK 被替换。
+MAGISKBOOT_APK_SHA256 = "e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5"
 
 # 推荐产物：本机 (android12-5.10 / MTK Dimensity) 实测只有 gzip 内核能启动，
 # 裸 Image 与 lz4 都会无限重启。该值仅用于 README / Release 说明与产物标注。
@@ -209,6 +287,23 @@ class BuildConfig:
 
     def get_susfs_patch_filename(self) -> str:
         return f"50_add_susfs_in_gki-{self.android_version}-{self.kernel_version}.patch"
+
+    def produces_boot_img(self) -> bool:
+        """是否产出 fastboot 可刷的 boot*.img。
+
+        2026-11-10 规则（与 ShirkNeko/GKI_KernelSU_SUSFS v2.1.0 的产物形态对齐，
+        并按使用者要求收窄）：
+          - android12-5.10 / android13-5.15：有 Google certified boot 模板，
+            用 magiskboot 打包，产 3 个 boot*.img + AnyKernel3.zip；
+          - android14-6.1 / android15-6.6：只产 AnyKernel3.zip。
+            这些家族的 boot 头/ramdisk/VBMETA 差异大，通用 mkbootimg 打包器
+            （无 ramdisk、硬编码 os_version 12、无 VBMETA）产出的是残缺镜像，
+            不如交给 AnyKernel3 在设备上按原厂 boot 分区重打包。
+        """
+        return (self.android_version, self.kernel_version) in {
+            ("android12", "5.10"),
+            ("android13", "5.15"),
+        }
 
     def is_lts(self) -> bool:
         return self.sub_level == "X"

@@ -1,5 +1,23 @@
 # GKI SukiSU-Ultra + SUSFS 构建系统
 
+> # ⚠️⚠️ 必读：Android 15 / 6.6 内核 **不支持 KPM** ⚠️⚠️
+>
+> **`android15-6.6` 系列构建会跳过 KPM（KernelPatch）注入，产物中 KPM 不可用。**
+>
+> - 内核侧 `CONFIG_KPM=y` 桥接层仍会编译进去，但**不会注入 kpimg**，
+>   管理器里 KPM 会显示未修补 / 不可用，`PROBE` 返回 `-EOPNOTSUPP`。
+> - 原因与社区一致：6.6 上 KernelPatch 有已知的随机重启 / 启动不稳定问题，
+>   因此按社区惯例整体跳过，不为 6.6 打 KPM 补丁。
+> - 这不是构建失败，也不要通过改配置强行打开 —— 强行注入会导致设备
+>   **logo 阶段无限重启**。
+> - 需要 KPM 请使用 `android12-5.10` / `android13-5.15` 系列。
+>
+> 另外：**`android14-6.1` / `android15-6.6` 只提供 `AnyKernel3.zip`，
+> 不提供 fastboot 可刷的 `boot*.img`**；只有 `android12-5.10` /
+> `android13-5.15` 提供 `boot*.img`（用 Google certified boot 模板打包）。
+
+---
+
 ### 这是一个自动构建 GKI 内核的仓库
 
 > 不支持一加 ColorOS14、15 和非 GKI 
