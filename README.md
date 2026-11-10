@@ -40,6 +40,64 @@
 4. 选择 Android 版本、Kernel 版本和构建选项
 5. 可选：指定 SukiSU-Ultra 或 SUSFS 的 commit hash
 
+##### 参数怎么填（重要）
+
+**`Android 版本` + `Kernel 版本` + `Sub Level` + `OS Patch Level` 必须配套使用**，
+内核源码分支名是 `common-<android>-<kernel>-<os_patch_level>`，填错组合
+这个分支不存在。仓库里新增了 `validate_params.py` 前置校验：组合非法时会
+**在下载源码之前**就报错并列出该家族所有合法取值，不会让你白等半小时。
+
+| Android | Kernel | Sub Level | OS Patch Level |
+|---|---|---|---|
+| android12 | 5.10 | 136 | 2022-11 |
+| android12 | 5.10 | 198 | 2024-01 |
+| android12 | 5.10 | 209 | 2024-05 |
+| android12 | 5.10 | **236** | **2025-05** ← 默认值（Redmi Note 11 Pro 5G 实机验证）|
+| android12 | 5.10 | X | lts |
+| android13 | 5.15 | 74 | 2023-01 |
+| android13 | 5.15 | 123 | 2023-11 |
+| android13 | 5.15 | 148 | 2024-05 |
+| android13 | 5.15 | 170 | 2025-01 |
+| android13 | 5.15 | 178 | 2025-03 |
+| android13 | 5.15 | 180 | 2025-05 |
+| android14 | 6.1 | 78 | 2024-06 |
+| android14 | 6.1 | 90 | 2024-08 |
+| android14 | 6.1 | 99 | 2024-10 |
+| android14 | 6.1 | 124 | 2025-02 |
+| android14 | 6.1 | 145 | 2025-09 |
+| android15 | 6.6 | 50 | 2024-10 |
+| android15 | 6.6 | 66 | 2025-02 |
+| android15 | 6.6 | 102 | 2025-10 |
+
+几个容易搞混的概念：
+
+- **Sub Level**（如 `236`、`124`）：内核的小版本号，**数值越大越新**。
+  它和 OS Patch Level 是一一对应的，单独填没有意义。
+- **OS Patch Level**（如 `2025-05`、`2025-02`）：内核源码分支的**发布日期**，
+  不是你手机的安全补丁日期。GKI 的每个发布月对应一个分支。
+- **`X` + `lts`**：长期支持分支，只在 android12-5.10 下存在。
+- **`Revision`**：只有 android12-5.10 需要填（`r1`/`r13`/`r15`/`r17`），
+  用来定位 Google 官方 certified boot 模板；5.15 / 6.1 / 6.6 **留空即可**。
+
+**其它开关怎么选**：
+
+| 开关 | 默认 | 说明 |
+|---|---|---|
+| `use_kpm` | ✅ 开 | 启用 KPM（KernelPatch），可加载 `.kpm` 模块。**android15-6.6 会自动跳过**（社区已知不稳定）|
+| `use_zram` | ❌ 关 | ZRAM 内存压缩（LZ4KD），只影响内存占用，**与 root / KPM / SUSFS 无关**，按需开 |
+| `BBG` | ❌ 关 | Baseband-guard，仅基带相关机型需要 |
+| `supp_op` | ❌ 关 | OnePlus 8E 专用支持 |
+| `set_defbbr` | ❌ 关 | 把 BBR 设为默认拥塞算法（改善跨境/弱网吞吐）|
+| `custom_version` | 空 | 自定义版本名后缀，留空则用 `android12-5.10.236-2025-05` 这种默认名 |
+| `kernelsu_commit` / `susfs_commit` | 空 | 指定具体 commit 复现构建，留空用默认（KSU 已钉在 `builtin@1cfa5734`）|
+
+**产物**：
+- `android12-5.10` / `android13-5.15` → `boot.img` + `boot-gz.img` + `boot-lz4.img` + 3 个 AnyKernel3.zip
+- `android14-6.1` / `android15-6.6` → 只有 3 个 AnyKernel3.zip
+
+> 刷机提示：本机（MTK 5.10）**只刷 `boot-gz.img`**，
+> 裸 `boot.img` 和 `boot-lz4.img` 会导致无限重启。
+
 #### 方式二：构建所有版本
 1. 选择 **Build Kernels**
 2. 点击 **Run workflow**

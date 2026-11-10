@@ -26,17 +26,17 @@ on:
         type: string
         default: ''
       custom_version:
-        description: '自定义版本名称 (可选)'
+        description: '自定义版本后缀 (可选)。留空则用默认版本名'
         required: false
         type: string
         default: ''
       use_zram:
-        description: '启用 ZRAM (LZ4KD)'
+        description: '启用 ZRAM (LZ4KD) 内存压缩。与 root / KPM / SUSFS 无关，按需开启'
         required: true
         type: boolean
         default: false
       use_kpm:
-        description: '启用 KPM'
+        description: '启用 KPM（KernelPatch）。android15-6.6 会自动跳过，详见 README'
         required: true
         type: boolean
         default: true
@@ -47,11 +47,6 @@ on:
         default: false
       make_release:
         description: '创建 GitHub Release'
-        required: true
-        type: boolean
-        default: true
-      send_telegram:
-        description: '发送 Telegram 通知'
         required: true
         type: boolean
         default: true
@@ -158,6 +153,16 @@ jobs:
           cache_path: /home/runner/.ccache
           cache_key: ${{ github.ref_name }}-${{ matrix.config.android }}-${{ matrix.config.kernel }}-${{ matrix.config.sub_level }}
           cache_bucket: ccache-cache
+
+      # 下载几十 GB 内核源码之前先校验矩阵里的组合合法
+      - name: Validate build parameters
+        run: |
+          cd ${{ env.SCRIPTS_DIR }}
+          python3 validate_params.py \
+            --android "${{ matrix.config.android }}" \
+            --kernel "${{ matrix.config.kernel }}" \
+            --sub-level "${{ matrix.config.sub_level }}" \
+            --os-patch "${{ matrix.config.os_patch }}"
 
       - name: Build kernel
         run: |
@@ -315,36 +320,8 @@ jobs:
         if: steps.prepare-summary.outputs.success != '0'
         id: get-release-url
         run: |
-          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${{ needs.prepare.outputs.kernel_version }}"
+          # tag 必须与 Create release 的 tag_name 一致（带 run_id），
+          # 否则打印出来的链接指向一个不存在的 tag。
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${{ needs.prepare.outputs.kernel_version }}-${{ github.run_id }}"
           echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
           echo "Release URL: $RELEASE_URL"
-
-      - name: Send Telegram Notification
-        if: ${{ github.event.inputs.send_telegram == 'true' }}
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-          SUCCESS: ${{ steps.prepare-summary.outputs.success }}
-          FAILED: ${{ steps.prepare-summary.outputs.failed }}
-        run: |
-          # 检查是否有成功的构建
-          if [ "$SUCCESS" -gt 0 ]; then
-            python3 ${{ env.SCRIPTS_DIR }}/telegram_notify.py release \
-              "${{ needs.prepare.outputs.kernel_version }}" \
-              "${{ steps.get-release-url.outputs.release_url }}" \
-              "${{ env.WORKSPACE_ROOT }}/release-files/RELEASE_BODY.md" \
-              "" \
-              "" \
-              "$SUCCESS" \
-              "$FAILED"
-          else
-            python3 ${{ env.SCRIPTS_DIR }}/telegram_notify.py release \
-              "${{ needs.prepare.outputs.kernel_version }}" \
-              "${{ steps.get-release-url.outputs.release_url }}" \
-              "" \
-              "" \
-              "" \
-              "0" \
-              "${{ steps.prepare-summary.outputs.total }}"
-          fi

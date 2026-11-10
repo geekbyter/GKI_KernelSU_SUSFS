@@ -16,7 +16,7 @@ on:
           - android13
           - android14
           - android15
-        default: android13
+        default: android12
       kernel_version:
         description: 'Kernel 版本'
         required: true
@@ -26,19 +26,19 @@ on:
           - "5.15"
           - "6.1"
           - "6.6"
-        default: "5.15"
+        default: "5.10"
       sub_level:
-        description: 'Sub Level 版本'
+        description: '内核小版本号（Sub Level）。决定编译哪个分支，必须与 OS Patch Level 配套。可用值：5.10 -> 136/198/209/236/X；5.15 -> 74/123/148/170/178/180；6.1 -> 78/90/99/124/145；6.6 -> 50/66/102'
         required: true
         type: string
-        default: '124'
+        default: '236'
       os_patch_level:
-        description: 'OS Patch Level'
+        description: '内核分支日期（OS Patch Level）。决定编译哪个分支，必须与 Sub Level 配套。可用值：5.10 -> 2022-11/2024-01/2024-05/2025-05/lts；5.15 -> 2023-01/2023-11/2024-05/2025-01/2025-03/2025-05；6.1 -> 2024-06/2024-08/2024-10/2025-02/2025-09；6.6 -> 2024-10/2025-02/2025-10'
         required: true
         type: string
-        default: '2025-02'
+        default: '2025-05'
       revision:
-        description: 'Android 12 Revision (可选)'
+        description: 'certified boot 模板的 revision（仅 5.10 需要，5.15/6.1/6.6 留空即可）'
         required: false
         type: string
         default: ''
@@ -61,17 +61,17 @@ on:
         type: string
         default: ''
       custom_version:
-        description: '自定义版本名称 (可选)'
+        description: '自定义版本后缀 (可选)。留空则用默认版本名，如 android12-5.10.236-2025-05'
         required: false
         type: string
         default: ''
       use_zram:
-        description: '启用 ZRAM (LZ4KD)'
+        description: '启用 ZRAM (LZ4KD) 内存压缩。与 root / KPM / SUSFS 无关，按需开启'
         required: true
         type: boolean
         default: false
       use_kpm:
-        description: '启用 KPM'
+        description: '启用 KPM（KernelPatch）。android15-6.6 会自动跳过，详见 README'
         required: true
         type: boolean
         default: true
@@ -92,11 +92,6 @@ on:
         default: false
       make_release:
         description: '创建 GitHub Release'
-        required: true
-        type: boolean
-        default: true
-      send_telegram:
-        description: '发送 Telegram 通知'
         required: true
         type: boolean
         default: true
@@ -181,6 +176,18 @@ jobs:
             echo "BOOT_SIGN_KEY not set; boot.img will be produced without an AVB footer"
           fi
 
+      # 在下载几十 GB 内核源码之前先校验参数组合合法。
+      # 组合非法时 repo init 会报 "manifest project not found" 之类的
+      # 迷惑错误，而且已经白下载了一堆工具链。
+      - name: Validate build parameters
+        run: |
+          cd ./.github/workflows/scripts
+          python3 validate_params.py \
+            --android "${{ github.event.inputs.android_version }}" \
+            --kernel "${{ github.event.inputs.kernel_version }}" \
+            --sub-level "${{ github.event.inputs.sub_level }}" \
+            --os-patch "${{ github.event.inputs.os_patch_level }}"
+
       - name: Build kernel
         run: |
           cd ./.github/workflows/scripts
@@ -227,21 +234,3 @@ jobs:
           echo "=== Creating checksums ==="
           sha256sum artifacts/* > SHA256SUMS.txt
           cat SHA256SUMS.txt
-
-      - name: Send Telegram Notification
-        if: ${{ github.event.inputs.send_telegram == 'true' && success() }}
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-        run: |
-          cd ./.github/workflows/scripts
-          python3 telegram_notify.py single \
-            "${{ github.event.inputs.android_version }}" \
-            "${{ github.event.inputs.kernel_version }}" \
-            "${{ github.event.inputs.sub_level }}" \
-            "${{ github.event.inputs.os_patch_level }}" \
-            "${{ github.event.inputs.kernelsu_version }}" \
-            "${{ github.event.inputs.use_zram }}" \
-            "${{ github.event.inputs.use_kpm }}" \
-            "../../SHA256SUMS.txt"
