@@ -326,11 +326,32 @@ CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=n
                                shell=True, capture_output=True, text=True).stdout.strip()
         if "deprecated" in remote:
             manifest_path = self.work_dir / ".repo/manifests/default.xml"
-            with open(manifest_path, "r") as f:
-                content = f.read()
-            content = content.replace(f'"{formatted_branch}"', f'"deprecated/{formatted_branch}"')
-            with open(manifest_path, "w") as f:
-                f.write(content)
+            # 2026-11-11 加固：repo init 在已有 .repo 时会重写 default.xml，
+            # 可能与本代码的读取撞上（读到了写了一半的文件）。
+            # 所以改写前先确认文件完整、且含我们要替换的字符串；
+            # 改写后再校验结果。若不匹配就报错，而不是让 repo sync
+            # 去报 "revision xxx not found" 那种看不懂的错。
+            if not manifest_path.exists():
+                raise RuntimeError(f"manifest 不存在: {manifest_path}")
+            content = manifest_path.read_text(errors="ignore")
+            plain = f'"{formatted_branch}"'
+            deprecated = f'"deprecated/{formatted_branch}"'
+            if deprecated in content:
+                # 已经是 deprecated 形式（repo init 保留了上一次的改写）
+                logger.info(f"manifest 已是 deprecated/{formatted_branch}，无需改写")
+            elif plain in content:
+                content = content.replace(plain, deprecated)
+                manifest_path.write_text(content)
+                # 校验改写生效
+                verify = manifest_path.read_text(errors="ignore")
+                if deprecated not in verify:
+                    raise RuntimeError("manifest 的 deprecated 前缀改写未生效")
+                logger.info(f"manifest 已改写为 deprecated/{formatted_branch}")
+            else:
+                raise RuntimeError(
+                    f"manifest 里既没有 {plain} 也没有 {deprecated}，"
+                    f"无法确认 kernel/common 的 revision（文件长度 {len(content)} 字节，"
+                    "可能被 repo init 截断）")
 
         self.env["REMOTE_BRANCH"] = remote
         logger.info("同步内核源代码...")

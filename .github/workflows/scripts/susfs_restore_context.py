@@ -58,21 +58,32 @@ COND_RE = re.compile(r"^\s*#\s*(?:ifndef|ifdef|if|if\s+!defined)\b")
 ENDIF_RE = re.compile(r"^\s*#\s*endif\b")
 
 
-def first_hunk_context_conds(hunk_lines):
-    """首个 hunk 上下文里的条件编译指令（有序、去重）。
+# #ifndef / #ifdef / #if 都是「无参」条件指令，必然配一个 #endif。
+CLOSER_FOR = {"#ifndef": "#endif", "#ifdef": "#endif", "#if": "#endif"}
 
-    不要求成对：hunk 边界常常在 #if 块中间截断（例如 fs/exec.c 的
-    `#ifndef __GENKSYMS__` 后面没有 #endif），此时源码里对应的 #endif
-    本来就存在，只要补开头即可。只补开头而漏补 #endif 才是危险的，
-    所以这里只返回「开指令」，由调用方按需插入。
+
+def first_hunk_context_conds(hunk_lines):
+    """首个 hunk 上下文里的条件编译指令，返回 [(开, 闭), ...]。
+
+    **必须成对**：2026-11-11 实测，android14-6.1-78 的 fs/exec.c 在
+    `#ifndef __GENKSYMS__` 那一块整个不存在（连 #endif 都没有），
+    只补开头会得到
+        fs/exec.c:71:2: error: unterminated conditional directive
+    所以这里为每个条件指令配上对应的 #endif，插入时两者一起插，
+    并且 include 放在这对指令**中间**（与上游源码的形状一致）。
     """
     out = []
     for line in hunk_lines:
         if line[:1] != " ":
             continue
         text = line[1:].strip()
-        if COND_RE.match(text) and text not in out:
-            out.append(text)
+        if not COND_RE.match(text):
+            continue
+        head = text.split()[0]
+        key = "#ifndef" if head in ("#ifndef", "#ifdef") else "#if"
+        pair = (text, CLOSER_FOR[key])
+        if pair not in out:
+            out.append(pair)
     return out
 
 def first_hunk_context_blanks(hunk_lines):
@@ -229,14 +240,20 @@ def restore_file(tree: Path, rel: str, includes, conds, blanks) -> tuple:
         for _ in range(max(0, want_blanks - have_blanks)):
             block.append("")
             added.append(f"{rel}: <blank>")
-        # 条件编译指令先于 include（只补开头；对应的 #endif 源码里本来就有，
-        # 例如 fs/exec.c 的 `#ifndef __GENKSYMS__`）
-        for opener in conds:
-            if opener not in present:
+        # 条件编译块包住 include，**成对插入**：源码里可能整块都不存在
+        # （android14-6.1-78 的 fs/exec.c 连 #endif 都没有），
+        # 只补开头会报 unterminated conditional directive。
+        pending_closer = None
+        for opener, closer in conds:
+            if opener not in present or closer not in present:
                 block.append(opener)
                 added.append(f"{rel}: {opener}")
+                pending_closer = closer
         block.append(f"#include {inc}")
         added.append(f"{rel}: #include {inc}")
+        if pending_closer:
+            block.append(pending_closer)
+            added.append(f"{rel}: {pending_closer}")
         insert_map.append((anchor, block))
         if not (tree / "include" / inc.strip("<>")).exists():
             if STUB_ONLY_RE.match(f"#include {inc}"):
