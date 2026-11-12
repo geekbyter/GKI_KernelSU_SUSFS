@@ -82,6 +82,13 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # 2026-11-12：限制并发。
+      # 矩阵有 19 个组合，每个都要 repo sync（~15 GB 源码）+ 完整编译
+      # （6.1/6.6 走 Bazel，约 15-25 分钟；5.10/5.15 走 make，约 5-10 分钟）。
+      # 不限制并发会一次性占满账户的 Actions 并发额度，导致大量 job 排队、
+      # 分钟数快速消耗，且 GitHub 队列超时会随机失败。
+      # 3 并发在速度与配额之间比较平衡；调大只影响耗时，不影响正确性。
+      max-parallel: 3
       matrix:
         config: ${{ fromJson(needs.prepare.outputs.build_matrix) }}
     env:
